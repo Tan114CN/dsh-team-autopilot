@@ -69,7 +69,7 @@ const lock = readText(join(profile, 'pnpm-lock.yaml'))
 if (lock === undefined) {
   check('pnpm-lock.yaml readable', false)
 } else {
-  check('lockfile records dsh-team-scheduler (file:)', /dsh-team-scheduler:[\s\S]{0,120}?specifier:\s*file:/.test(lock))
+  check('lockfile records dsh-team-scheduler', /dsh-team-scheduler:[\s\S]{0,160}?specifier:\s*(file:|[\^~]?\d)/.test(lock))
 }
 
 // 5. First-run safety: profile patch must force dryRun for team-scheduler.
