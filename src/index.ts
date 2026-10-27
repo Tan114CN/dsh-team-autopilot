@@ -93,7 +93,7 @@ const STATUS_SCHEMA = {
 export function apply(ctx: Context, config: Config = {}): void {
   const resolved: Required<Config> = {
     enabled: config.enabled ?? true,
-    tickTimeoutMs: config.tickTimeoutMs ?? 30_000,
+    tickTimeoutMs: Math.min(Math.max(config.tickTimeoutMs ?? 30_000, 10_000), 3_600_000),
     maxConcurrent: config.maxConcurrent ?? 2,
     wakeCooldownMs: config.wakeCooldownMs ?? 60_000,
     dryRun: config.dryRun ?? false,

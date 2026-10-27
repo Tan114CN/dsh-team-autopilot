@@ -37,6 +37,7 @@ export interface SchedulerState {
   /** Diagnostics: what the last round actually saw on the board. */
   team: string
   tasks: number
+  /** Slots occupied this round: `in_progress` or owner-claimed `pending`. */
   inFlight: number
   claimable: number
   idle: number
@@ -66,6 +67,15 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
     }, ms)
     signal.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+/**
+ * Exponential backoff for consecutive loop failures, capped at 30s.
+ * @param failures - consecutive failure count, at least 1.
+ * @returns the pause duration in milliseconds.
+ */
+function backoffMs(failures: number): number {
+  return Math.min(2_000 * 2 ** Math.min(failures - 1, 4), 30_000)
 }
 
 /**
@@ -143,17 +153,22 @@ export async function tick(
   const teamKey = membership === undefined ? 'default' : String(membership.id)
   const budget = resolveBudget(teamKey, config.teamBudgets, config.maxConcurrent)
 
+  // `inFlight` comes from `planDispatch` so the diagnostic counters share one
+  // slot rule with the actual decision: in_progress, or pending with an owner.
+  const { plans, blocked, inFlight } = planDispatch({
+    tasks,
+    members,
+    maxConcurrent: budget,
+  })
+
   // Diagnostics: capture what this round actually saw, so the status tool can
   // explain "why nothing dispatched" without guesswork.
-  const inFlight = tasks.filter(task => task.status === 'in_progress').length
   state.team = teamKey
   state.tasks = tasks.length
   state.inFlight = inFlight
   state.claimable = claimableTasks(tasks).length
   state.idle = availableMembers(members, tasks).length
   state.slots = Math.max(0, budget - inFlight)
-
-  const { plans, blocked } = planDispatch({ tasks, members, maxConcurrent: budget })
 
   state.rounds += 1
   state.lastBlocked = blocked.length
@@ -202,6 +217,8 @@ export async function tick(
  * change landing during the round cannot be missed — `waitForChange` keeps no
  * history. The loop also treats a disposed service as fatal: it returns
  * `{ timedOut: false }` in that case, which would otherwise look like activity.
+ * Consecutive wait/tick failures back off exponentially (capped at 30s) so a
+ * persistently broken host cannot spin the loop at full speed.
  * @param ctx - host context.
  * @param config - resolved configuration.
  * @param state - mutable counters.
@@ -216,6 +233,13 @@ export async function loop(
   signal: AbortSignal,
 ): Promise<void> {
   let breaker = createBreaker()
+  let failures = 0
+  // Drop suppression stamps that can no longer suppress anything, so the map
+  // stays bounded by the number of tasks actually woken within one cooldown.
+  const prune = (): void => {
+    const cutoff = Date.now() - config.wakeCooldownMs
+    for (const [taskId, at] of lastWake) if (at < cutoff) lastWake.delete(taskId)
+  }
   while (!signal.aborted) {
     const lead = findLead(ctx)
     if (lead === undefined) {
@@ -228,14 +252,26 @@ export async function loop(
     } catch (error: unknown) {
       if (signal.aborted) return
       state.lastError = describe(error)
+      failures += 1
+      prune()
+      await pause(backoffMs(failures), signal)
+      if (signal.aborted) return
+      continue
     }
     if (signal.aborted) return
 
     try {
       breaker = await tick(ctx, lead, config, state, lastWake, breaker, signal)
+      failures = 0
     } catch (error: unknown) {
       if (signal.aborted) return
       state.lastError = describe(error)
+      failures += 1
+      prune()
+      await pause(backoffMs(failures), signal)
+      if (signal.aborted) return
+      continue
     }
+    prune()
   }
 }

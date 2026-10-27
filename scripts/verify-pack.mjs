@@ -24,8 +24,10 @@ const check = (label, ok, detail = '') => results.push({ label, ok: Boolean(ok),
 function packJson() {
   const args = ['pack', '--dry-run', '--json', '--ignore-scripts']
   const npmExec = process.env.npm_execpath
-  if (npmExec !== undefined && npmExec !== '') {
-    // Invoked from an `npm run` script: reuse the exact npm CLI.
+  // Under `npm run`, npm_execpath is npm-cli.js and reusable. Under `pnpm run`
+  // it points at pnpm, which does not accept this argument shape — fall back
+  // to the npm binary on PATH instead.
+  if (npmExec !== undefined && /npm-cli\.js$/i.test(npmExec)) {
     return execFileSync(process.execPath, [npmExec, ...args], {
       cwd: root,
       encoding: 'utf8',

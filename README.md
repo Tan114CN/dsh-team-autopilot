@@ -63,7 +63,7 @@ dsh plugin --profile web add dsh-team-scheduler
 ## 设计决策（都来自源码核验）
 
 **1. 只唤醒，不代认领。**  
-`updateTask` 的 `claim` 动作留给成员自己走 `list → get → claim` 流程。调度器代认领会和成员争抢所有权，而 CAS 冲突只会让成员白跑一轮。代价是多一次往返，换来的是所有权语义干净。
+`updateTask` 的 `claim` 动作留给成员自己走 `list → get → claim` 流程。调度器代认领会和成员争抢所有权，而 CAS 冲突只会让成员白跑一轮。代价是多一次往返，换来的是所有权语义干净。唤醒消息把任务 title 当**数据**处理（折叠空白、按码点截断、中和反引号），避免任务标题被当成跨 agent 的指令注入。
 
 **2. 先挂 waiter，再读状态。**  
 `waitForChange` 内部只是一个 `Map<TeamId, Set<Waiter>>`，**没有任何历史缓冲**——注册之前发生的边沿永久丢失。所以顺序必须是「先 `waitForChange`，后全量 `listTasks`」，否则会漏掉窗口期内的变化。
@@ -75,7 +75,7 @@ dsh plugin --profile web add dsh-team-scheduler
 成员只有 4 态：`running` / `inactive` / `provisioning` / `failed`。**没有 `idle`**。`inactive` 表示当前没有回合在执行，`sendMessage` 会启动或恢复它。`running` 在干活、`provisioning` 还没起来、`failed` 已废。
 
 **5. 写域判定与原生一致，但多一层防御。**  
-用 `left === right || left.startsWith(right + '/') || right.startsWith(left + '/')` 的 `/` 分段规则（所以 `src/a` 不会误判与 `src/ab` 冲突）。另外 `claimableTasks` 除了看派生的 `ready` 标志，还强制要求 `status === 'pending'`——不盲目信任别的组件产出的派生值。**真机注意**：无主任务在运行时 `ownerName` 是 `null`（不是 `undefined`），所有 owner 判定统一用 `== null`，否则会把无主任务误判为"有主"而全部跳过。
+用 `left === right || left.startsWith(right + '/') || right.startsWith(left + '/')` 的 `/` 分段规则（所以 `src/a` 不会误判与 `src/ab` 冲突）。另外 `claimableTasks` 除了看派生的 `ready` 标志，还强制要求 `status === 'pending'`——不盲目信任别的组件产出的派生值。**真机注意**：无主任务在运行时 `ownerName` 是 `null`（不是 `undefined`），所有 owner 判定统一用 `== null`，否则会把无主任务误判为"有主"而全部跳过。归一化还会折叠 `.`/`..` 段，并在 win32 上折叠大小写（Windows 文件系统大小写不敏感，`src/Auth` 与 `src/auth` 视为同一目标）。
 
 **6. 同轮去重 + 冷却窗口。**  
 一轮内多个任务可能写域重叠，先分配的会占住作用域；跨轮则用 `wakeCooldownMs` 抑制重复唤醒——因为发消息本身会触发 activity 通知，不设冷却会反复叫同一个还没 claim 的成员。
@@ -110,8 +110,9 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 21 checks passed
+node tests/verify.ts                            # → OK — 27 checks passed
 node tests/integration.ts                       # → OK — 4 integration checks passed
+node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
 ```
 
 - **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
