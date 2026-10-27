@@ -284,6 +284,15 @@ test('normalizeScope folds dot segments but keeps a leading ..', () => {
   assert.equal(normalizeScope('../src/../a'), '../a')
 })
 
+test('normalizeScope keeps dotfiles and never clamps relative ascent', () => {
+  // '.hidden' is a filename segment, not the '.' self-reference.
+  assert.equal(normalizeScope('src/.hidden/a'), 'src/.hidden/a')
+  assert.equal(normalizeScope('src/a/..'), 'src')
+  // Nothing is absolute here, so surplus '..' survives instead of clamping.
+  assert.equal(normalizeScope('src/../../..'), '../..')
+  assert.equal(normalizeScope('..'), '..')
+})
+
 test('case folding follows the platform filesystem', () => {
   if (process.platform === 'win32') {
     assert.equal(normalizeScope('Src/Auth'), 'src/auth')
@@ -297,6 +306,10 @@ test('case folding follows the platform filesystem', () => {
 test('scopesOverlap normalizes dot segments before comparing', () => {
   assert.equal(scopesOverlap('src/a/../b', 'src/b'), true)
   assert.equal(scopesOverlap('src/./a', 'src/a/deep'), true)
+  // An empty scope stays "unspecified" even when the other side folds down.
+  assert.equal(scopesOverlap('', 'src/a/..'), false)
+  // '..' is a segment of its own, not a prefix of 'src'.
+  assert.equal(scopesOverlap('..', 'src'), false)
 })
 
 test('planDispatch counts owner-claimed pending work as in flight', () => {
