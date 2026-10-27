@@ -62,7 +62,8 @@
     "integration": "node tests/integration.ts",
     "verify:mount": "node scripts/verify-mount.mjs",
     "verify:pack": "npm run build && node scripts/verify-pack.mjs",
-    "test": "node tests/verify.ts && node tests/integration.ts",
+    "acceptance": "node scripts/acceptance.mjs",
+    "test": "node tests/verify.ts && node tests/integration.ts && node scripts/acceptance.mjs",
     "prepack": "node node_modules/tsdown/dist/run.mjs",
     "prepublishOnly": "node node_modules/typescript/bin/tsc --noEmit && node tests/verify.ts && node tests/integration.ts"
   },
