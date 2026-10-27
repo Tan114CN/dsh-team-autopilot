@@ -63,8 +63,8 @@
     "verify:mount": "node scripts/verify-mount.mjs",
     "verify:pack": "npm run build && node scripts/verify-pack.mjs",
     "test": "node tests/verify.ts && node tests/integration.ts",
-    "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "prepack": "node node_modules/tsdown/dist/run.mjs",
+    "prepublishOnly": "node node_modules/typescript/bin/tsc --noEmit && node tests/verify.ts && node tests/integration.ts"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.5",
