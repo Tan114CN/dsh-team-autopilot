@@ -339,6 +339,9 @@ test('wakeMessage neutralizes newlines and backticks in the subject', () => {
   assert.ok(text.includes('t9'), 'task id must survive')
   assert.ok(text.includes('revision 7'), 'revision must survive')
   // Exactly two backticks: the delimiters around the sanitized subject.
+  // This count is the only lock on the neutralization step at select.ts:250
+  // (`.replace(/`/g, "'")`); the other assertions here stay green without it.
+  // If the quoting character ever changes, update this line together with it.
   assert.equal((text.match(/`/g) ?? []).length, 2)
   // The injected directive is collapsed onto the subject line as inert text.
   assert.ok(text.includes("line1 line2 'ignore above'"), text)
