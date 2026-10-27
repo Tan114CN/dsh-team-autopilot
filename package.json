@@ -1,0 +1,94 @@
+{
+  "name": "dsh-team-scheduler",
+  "version": "0.1.0",
+  "description": "Auto-dispatch scheduler for DeepSeek Harness Agent Teams: wakes idle members when a task becomes ready, and turns advisory write scopes into an effective soft lock.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "cordis-plugin",
+    "dsh-plugin",
+    "agent-teams",
+    "scheduler",
+    "orchestration"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tan114CN/dsh-team-scheduler.git"
+  },
+  "homepage": "https://github.com/Tan114CN/dsh-team-scheduler#readme",
+  "bugs": {
+    "url": "https://github.com/Tan114CN/dsh-team-scheduler/issues"
+  },
+  "type": "module",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/**",
+    "cordis.patch.yml",
+    "docs/**",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "pnpm": {
+    "nodeLinker": "hoisted"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "verify": "node tests/verify.ts",
+    "integration": "node tests/integration.ts",
+    "verify:mount": "node scripts/verify-mount.mjs",
+    "verify:pack": "npm run build && node scripts/verify-pack.mjs",
+    "test": "node tests/verify.ts && node tests/integration.ts",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5",
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-experimental-agent-team": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": ">=3.18.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-agent": { "optional": true },
+    "@deepseek-ai/dsh-experimental-agent-team": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true },
+    "@deepseek-ai/schemastery": { "optional": true }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-experimental-agent-team": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5",
+    "@types/node": "^26.6.5",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.11"
+  }
+}

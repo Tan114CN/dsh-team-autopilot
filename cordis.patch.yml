@@ -1,0 +1,20 @@
+# team-scheduler — mount beside the experimental Agent Teams bundle.
+#
+# Precondition: this patch must apply AFTER a profile that already provides
+# ctx.agentTeams, i.e. @deepseek-ai/dsh-experimental-agent-team-profile (or any
+# composition mounting @deepseek-ai/dsh-experimental-agent-team).
+# Without it the plugin's `inject` cannot resolve and the plugin will not load.
+
+- insert:
+    - id: team-scheduler
+      name: dsh-team-scheduler
+      config:
+        enabled: true
+        tickTimeoutMs: 30000
+        maxConcurrent: 2
+        wakeCooldownMs: 60000
+        dryRun: false
+        teamBudgets: {}
+        errorThreshold: 3
+        openCooldownMs: 60000
+        halfOpenProbe: 1

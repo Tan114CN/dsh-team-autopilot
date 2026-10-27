@@ -1,0 +1,9 @@
+node_modules/
+lib/
+dist/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+.workbuddy/
