@@ -103,17 +103,20 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 ```
 
 - `dist/` 被 `.gitignore` 忽略，但 `prepack` 会在打包前强制重建，所以**从干净检出发布也安全**。
-- 版本号手动改 `package.json`（本项目不使用 changesets）。请用 `npm publish`，不要用 `pnpm publish`。
+- 版本号手动改 `package.json`（本项目不使用 changesets），并同步更新 `CHANGELOG.md` 的 `[Unreleased]` / 新版本段。请用 `npm publish`，不要用 `pnpm publish`。
 - 发布后自检：`npm view dsh-team-scheduler dist.tarball`，或 `npm pack dsh-team-scheduler && tar -tzf dsh-team-scheduler-*.tgz`。
 
 ## 已验证
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 27 checks passed
+node tests/verify.ts                            # → OK — 28 checks passed
 node tests/integration.ts                       # → OK — 4 integration checks passed
+node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
 ```
+
+> `npm test` = `verify` + `integration` + `acceptance` 三套聚合；`npm run acceptance` 单独跑端到端验收。
 
 - **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
 - **零依赖自检**：纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）有 21 项断言覆盖。`select.ts` / `breaker.ts` 只有 `import type` 或无外部依赖，所以 `node tests/verify.ts` 不需要任何 `node_modules` 也能跑。

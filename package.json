@@ -39,6 +39,7 @@
   ],
   "sideEffects": false,
   "license": "MIT",
+  "author": "Tan114CN",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
