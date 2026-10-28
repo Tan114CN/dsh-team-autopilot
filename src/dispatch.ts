@@ -338,11 +338,25 @@ export async function tick(
       }
     }
     released += 1
-    releasedTargets.push({ taskId: String(target.taskId), previousOwner: target.previousOwner })
+    const releasedId = String(target.taskId)
+    releasedTargets.push({ taskId: releasedId, previousOwner: target.previousOwner })
+    // A reclaim is proof the task *had* an owner: `planReclaim` only releases
+    // in-flight tasks, and in-flight means someone claimed it. If that task's
+    // wake is still owed a post-wake check, the reclaim settles it as a
+    // success — otherwise a later settle that reads the now-cleared owner
+    // (`ownerName == null`) would count "claimed then reclaimed" as "never
+    // answered", climb `unclaimed`, and trip the false alarm in the report.
+    if (team.pendingWakes.has(releasedId)) {
+      team.pendingWakes.delete(releasedId)
+      if (team.lastDispatch?.taskId === releasedId) team.lastDispatch.claimed = true
+      // The member answered the wake (it claimed); a later refusal is a
+      // different situation, so clear any stale record under the old one.
+      team.declined.delete(releasedId)
+    }
     // Recorded even under dryRun, where `applied` stays false: the point of
     // the record is to show what the autopilot decided and about which task.
     team.lastReclaim = {
-      taskId: String(target.taskId),
+      taskId: releasedId,
       reason: target.reason,
       previousOwner: target.previousOwner,
       at: Date.now(),
@@ -350,7 +364,7 @@ export async function tick(
     }
     // The round's release list, so a round that reclaimed several owners logs
     // all of them instead of only the last one.
-    team.reclaimsThisRound.push(`${String(target.taskId)}<${target.previousOwner}`)
+    team.reclaimsThisRound.push(`${releasedId}<${target.previousOwner}`)
   }
   if (released > 0) {
     team.reclaimed += released
@@ -391,6 +405,15 @@ export async function tick(
   // it was taken from* took it up again. The last clause is what keeps a
   // `dryRun` host honest — there the board never changes, so the task still
   // shows the same owner and the park must survive to be reported.
+  //
+  // A task re-opened back to unowned `pending` (owner cleared, no new owner)
+  // is deliberately *not* treated as over: that is also exactly the state a
+  // reclaim leaves the task in, and a park exists to hold the task there until
+  // a human or the Lead takes it. The human can end the stand-off at any time
+  // by claiming it — which *does* satisfy the owner-change clause and clears
+  // the park. This is a known limit, not an oversight: the two situations
+  // ("reclaim left it unowned" vs "someone re-opened it unowned") are
+  // indistinguishable from the board alone.
   //
   // `reclaimCounts` follows the same rule, which is also how both maps stay
   // bounded by the tasks actually in play rather than by every id ever seen.

@@ -360,13 +360,16 @@ export function planDispatch(input: PlanInput): PlanResult {
   const plannedScopes: Array<{ scope: string; taskId: string }> = []
 
   /**
-   * Why one task cannot be handed out this round, or undefined when it can.
+   * Why one task cannot be handed out this round, or undefined when it can —
+   * or when its only "cause" is that every idle teammate is already assigned
+   * this round (normal queue backpressure, not a defect worth reporting).
    *
    * Shared by the capacity-full branch and the normal branch so the two never
    * disagree about a task's cause. Pure — it reads `input`, `tasks`, `free`,
    * `used`, and `plannedScopes` and mutates none of them.
    * @param task - task being evaluated.
-   * @returns the skip cause, or undefined when the task is dispatchable.
+   * @returns the skip cause, or undefined when the task is dispatchable or
+   *   merely waiting behind this round's already-assigned members.
    */
   const explainSkip = (task: TeamTaskView): BlockedTask | undefined => {
     const reclamations = input.parked?.get(task.id)
@@ -393,17 +396,25 @@ export function planDispatch(input: PlanInput): PlanResult {
 
     const skip = input.avoid?.get(task.id)
     if (pickMember(free, used, skip) === undefined) {
-      // Telling the two causes apart matters: "no idle teammate" is fixed by
-      // adding a member, "everyone declined" by looking at why the existing
-      // ones stop accepting.
-      const hadCandidate = free.some(entry => !used.has(entry.name))
-      return hadCandidate
-        ? {
-            taskId: task.id,
-            kind: 'declined',
-            reason: `every idle teammate already declined this task (${[...skip ?? []].join(', ')})`,
-          }
-        : { taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' }
+      // Three causes, three fixes, and none of them is "the members are gone":
+      //  - an empty `free` pool is a genuine member shortage, fixed by adding a
+      //    teammate — `noMember`;
+      //  - `free` members all already handed work *this round* is normal queue
+      //    backpressure, not a shortage — it resolves next round without
+      //    anyone doing anything, so it reports nothing (no blocked entry) and
+      //    must not climb `skippedNoMember`, which an operator reads as "add a
+      //    member";
+      //  - everyone left has already declined this exact task — `declined`.
+      if (free.length === 0) {
+        return { taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' }
+      }
+      const unassigned = free.some(entry => !used.has(entry.name))
+      if (!unassigned) return undefined
+      return {
+        taskId: task.id,
+        kind: 'declined',
+        reason: `every idle teammate already declined this task (${[...skip ?? []].join(', ')})`,
+      }
     }
     return undefined
   }

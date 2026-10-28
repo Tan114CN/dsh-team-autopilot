@@ -25,7 +25,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { createBreaker } from '../src/breaker.ts'
 import { tick, loop } from '../src/dispatch.ts'
-import { createAutopilotState } from '../src/state.ts'
+import { createAutopilotState, teamState } from '../src/state.ts'
 import type { AutopilotState } from '../src/state.ts'
 import type { Config } from '../src/index.ts'
 
@@ -581,6 +581,38 @@ await test('does not count a wake that was answered', async () => {
   const team = teamOf(state)
   assert.equal(team.lastDispatch?.claimed, true)
   assert.equal(team.unclaimed, 0)
+})
+
+await test('a reclaim settles a still-pending wake as answered, not unclaimed', async () => {
+  // A member claims, then stalls, then is reclaimed. If the wake's cooldown is
+  // longer than the reclaim grace period, the task is still owed a post-wake
+  // check when the reclaim fires. Reading the now-cleared owner at that point
+  // used to count "claimed then reclaimed" as "never answered" and climb
+  // `unclaimed` — the reclaim itself is the proof someone answered.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 30_000 }
+  const team = teamState(state, 'team-1')
+  // The wake is still owed its check (cooldown not yet elapsed), and the task
+  // has an owner: this is a wake that was answered and then the owner stalled.
+  team.pendingWakes.set('t1', { memberName: 'alice', at: Date.now() - 5_000 })
+  team.lastDispatch = { taskId: 't1', memberName: 'alice', at: Date.now() - 5_000, repeats: 1, sent: true }
+  // Alice has been stalled past the grace period, so the reclaim fires now.
+  const stalled = new Map<string, number>([['t1', Date.now() - 600_000]])
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), stalled, createBreaker(), signal)
+
+  // The stalled owner is released, and the wake that preceded it is settled as
+  // answered — not left to a later settle that would read the cleared owner and
+  // count a false "never claimed".
+  assert.equal(teamOf(state).reclaimed, 1, 'the stalled owner is released')
+  assert.equal(teamOf(state).unclaimed, 0, 'a reclaimed answer is not a refusal')
+  assert.equal(teamOf(state).pendingWakes.has('t1'), false, 'the wake is no longer owed a check')
+  // Alice was the only member, and the reclaim avoids handing the task straight
+  // back to her, so no new wake is recorded — the settled `claimed=true` stands.
+  assert.equal(teamOf(state).lastDispatch?.claimed, true, 'the reclaim settles the wake as claimed')
 })
 
 await test('splits skipped tasks into scope conflicts and missing members', async () => {

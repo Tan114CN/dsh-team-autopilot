@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-10-29
+
+### 修复
+
+- **「本轮排满」不再误报成「没有空闲成员」。** `planDispatch` 之前把「空闲成员都已在本轮被派出去」记成 `noMember` 并累加 `skippedNoMember`，可此时明明有成员空闲，排查者会被引导去「加人」。现在三分：成员池为空 → `noMember`；空闲成员本轮已排满 → 正常排队背压，不产生 blocked 条目、不计 `skippedNoMember`；剩余成员都拒绝过该任务 → `declined`。
+- **认领后被回收不再记成「无人应答」。** 任务被唤醒 → 成员认领 → 僵死 → 被回收时，若该 wake 仍待判定（`wakeCooldownMs` 比 `reclaimAfterMs` 长），回收会清空 owner，后续 settle 读到 `ownerName == null` 就误判 `unclaimed` 并触发报告里的误告警。现在回收本身就是「有人认领过」的铁证，回收时把该任务从待判定集合移除、settle 为 `claimed`，不再累加 `unclaimed`。
+
+### 加固
+
+- **状态报告不再交出内部引用。** `toTeamReport` 之前把 `parked` 记录、`lastReclaim`、`lastDispatch` 作为 state 内部对象本身返回，下一轮会原地改写它们（填 `claimed`、加 `repeats`、重停派）。现在各加一层浅拷贝，持有报告行之后再改团队状态，行内容不变。
+- **停派解除条件的已知限制写进注释。** 任务「原地 reopen 成无主 pending」与「回收留下的无主 pending」在 board 上无法区分，故不作为停派解除条件；人类认领即可解除停派。这是有意的边界，不是遗漏。
+
 ## [0.4.0] - 2026-10-29
 
 本次是只读审查（致命 1 / 中 24 / 低 24）后的一轮集中修复，覆盖 P1 行为正确性、P2 可观测性、P3 文档同步三档。日志格式有**破坏性变更**（`parked=` → `parkedSkips=`、`reclaim=`/`park=` → `reclaims=`/`parks=`/`unparks=`、新增 `sent=`/`err=`），依赖日志 grep 的运维脚本需同步更新。

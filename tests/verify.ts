@@ -248,6 +248,20 @@ test('planDispatch reports a task nobody is left to take as declined', () => {
   assert.match(result.blocked[0]?.reason ?? '', /alice/)
 })
 
+test('planDispatch reports backpressure as nothing, not as a member shortage', () => {
+  // Two tasks, one member. The member takes the first task; the second has no
+  // cause but "the only idle member is already assigned this round". That is
+  // normal queue backpressure, not a shortage — it must NOT produce a blocked
+  // entry (which would climb `skippedNoMember` and read as "add a member").
+  const result = planDispatch({
+    tasks: [task({ id: 't1' }), task({ id: 't2' })],
+    members: [member('alice', 'inactive')],
+    maxConcurrent: 4,
+  })
+  assert.deepEqual(result.plans.map(plan => plan.taskId), ['t1'])
+  assert.equal(result.blocked.length, 0, 'backpressure must not be reported as noMember')
+})
+
 test('planDispatch refuses a parked task however much room there is', () => {
   // Parking is not a shortage: the member, the slot and the scopes are all
   // available, and the task is still withheld. Reporting this as `noMember`
@@ -862,6 +876,29 @@ test('the status row reads why and pending from the round, not from the counters
   // mutates the state's own array in place.
   team.skipKinds.push('scope')
   assert.deepEqual(row.why, ['declined'], 'the reported row must not alias live state')
+})
+
+test('the status row copies the record fields it hands out', () => {
+  const team = teamState(createAutopilotState(), 'team-a')
+  team.parked.set('t1', { taskId: 't1', reclaims: 3, previousOwner: 'alice', at: 0 })
+  team.lastReclaim = { taskId: 't2', reason: 'owner inactive', previousOwner: 'bob', at: 0, applied: true }
+  team.lastDispatch = { taskId: 't3', memberName: 'carol', at: 0, repeats: 1, sent: true }
+
+  const row = toTeamReport(team)
+
+  // The row hands out copies: mutating the live record (as the next round does
+  // when it fills in `claimed`, bumps `repeats`, or re-parks the task) must not
+  // rewrite the object the caller already holds.
+  team.lastDispatch.claimed = true
+  team.lastDispatch.repeats = 5
+  team.lastReclaim.applied = false
+  const parkedRecord = team.parked.get('t1')
+  if (parkedRecord !== undefined) parkedRecord.reclaims = 9
+
+  assert.equal(row.lastDispatch?.claimed, undefined, 'lastDispatch must not alias live state')
+  assert.equal(row.lastDispatch?.repeats, 1)
+  assert.equal(row.lastReclaim?.applied, true)
+  assert.equal(row.parked[0]?.reclaims, 3, 'parked records must not alias live state')
 })
 
 test('statusLine stays one greppable line and grows as decisions happen', () => {

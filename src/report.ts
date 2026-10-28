@@ -138,7 +138,7 @@ export function toTeamReport(team: TeamState): TeamReport {
     breakerTrips: team.breakerTrips,
     breakerBlocked: team.breakerBlocked,
     reclaimed: team.reclaimed,
-    parked: [...team.parked.values()],
+    parked: [...team.parked.values()].map(record => ({ ...record })),
     tasks: team.tasks,
     inFlight: team.inFlight,
     claimable: team.claimable,
@@ -147,8 +147,8 @@ export function toTeamReport(team: TeamState): TeamReport {
     idle: team.idle,
     slots: team.slots,
     ...team.lastTickAt === undefined ? {} : { lastTickAt: team.lastTickAt },
-    ...team.lastReclaim === undefined ? {} : { lastReclaim: team.lastReclaim },
-    ...team.lastDispatch === undefined ? {} : { lastDispatch: team.lastDispatch },
+    ...team.lastReclaim === undefined ? {} : { lastReclaim: { ...team.lastReclaim } },
+    ...team.lastDispatch === undefined ? {} : { lastDispatch: { ...team.lastDispatch } },
   }
 }
 
