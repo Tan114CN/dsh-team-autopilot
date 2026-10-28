@@ -155,11 +155,12 @@ async function sendWake(
  * one line per round.
  * @param config - resolved configuration.
  * @param team - the team bucket, already updated for this round.
+ * @param lastError - the loop's most recent error, surfaced in the line.
  */
-async function recordStatus(config: Required<Config>, team: TeamState): Promise<void> {
+async function recordStatus(config: Required<Config>, team: TeamState, lastError?: string): Promise<void> {
   if (config.statusFile === '') return
   const now = Date.now()
-  const line = statusLine(team, now)
+  const line = statusLine(team, now, lastError)
   const signature = statusSignature(line)
   const quietFor = team.lastStatusAt === undefined ? Infinity : now - team.lastStatusAt
   if (signature === team.lastStatusSignature && quietFor < config.statusHeartbeatMs) return
@@ -221,6 +222,13 @@ export async function tick(
 
   const team = teamState(state, teamKey)
 
+  // This round's events start empty: the arrays below are drained into the
+  // status line at the end of the round, so a previous round's events must not
+  // leak into this one.
+  team.reclaimsThisRound = []
+  team.parksThisRound = []
+  team.unparksThisRound = []
+
   // Circuit breaker: skip dispatch entirely while open.
   const verdict = evaluate(breaker, Date.now(), bcfg)
   breaker = verdict.breaker
@@ -230,7 +238,7 @@ export async function tick(
     // Logged here too: a blocked round is exactly when the file is worth
     // reading, and skipping it would make the log go quiet at the one moment
     // an operator needs it to speak.
-    await recordStatus(config, team)
+    await recordStatus(config, team, state.lastError)
     return breaker
   }
 
@@ -319,6 +327,13 @@ export async function tick(
         // re-reads it. Reclaim never trips the breaker: a failing reclaim
         // must not stop a team from being handed the work it can still take.
         state.lastError = describe(error)
+        // A failed grace-expiry release must not reset the grace period. The
+        // task was judged stalled after `reclaimAfterMs`; putting the stamp
+        // back means the next round retries immediately instead of re-waiting
+        // the whole window, which is the "retry next round" contract in
+        // `docs/verify-reclaim.md`. `dryRun` never reaches this branch (it
+        // skips the write), so no stamp is written back under dry-run.
+        if (target.sinceAt !== undefined) stalled.set(String(target.taskId), target.sinceAt)
         continue
       }
     }
@@ -333,6 +348,9 @@ export async function tick(
       at: Date.now(),
       applied,
     }
+    // The round's release list, so a round that reclaimed several owners logs
+    // all of them instead of only the last one.
+    team.reclaimsThisRound.push(`${String(target.taskId)}<${target.previousOwner}`)
   }
   if (released > 0) {
     team.reclaimed += released
@@ -347,8 +365,8 @@ export async function tick(
   // is what tells the two apart: one reclaim is a stalled owner, the same task
   // back several times is work no member can finish, and no further wake will
   // change that. So past the limit the autopilot stops offering it and says so.
-  for (const released of releasedTargets) {
-    const taskId = released.taskId
+  for (const entry of releasedTargets) {
+    const taskId = entry.taskId
     const count = (team.reclaimCounts.get(taskId) ?? 0) + 1
     team.reclaimCounts.set(taskId, count)
     if (config.reclaimRetryLimit === 0 || count < config.reclaimRetryLimit) continue
@@ -356,13 +374,16 @@ export async function tick(
     const record: ParkRecord = {
       taskId,
       reclaims: count,
-      previousOwner: released.previousOwner,
+      previousOwner: entry.previousOwner,
       at: Date.now(),
     }
     team.parked.set(taskId, record)
     // Kept as the announcement, the same way `lastReclaim` is: the next
     // dispatch is the one that will not happen, and this is why.
     team.lastPark = record
+    // The round's park list, so a round that parked several tasks logs all of
+    // them instead of only the last one.
+    team.parksThisRound.push(`${taskId}<${entry.previousOwner}`)
   }
 
   // A park describes one stand-off, so it is dropped the moment that stand-off
@@ -386,6 +407,11 @@ export async function tick(
       || current.status === 'deleted'
       || (isInFlight(current) && String(current.ownerName) !== record.previousOwner)
     if (over) {
+      // The stand-off ended: the task moved on. This is as newsworthy as the
+      // park itself, and was previously invisible — the event line only fired
+      // while the park was live, so the clearing round changed nothing and the
+      // log never said "offered again".
+      team.unparksThisRound.push(taskId)
       forget(taskId)
       continue
     }
@@ -437,7 +463,7 @@ export async function tick(
     avoid,
     parked,
   })
-  const summary = boardSummary(tasks, members, budget)
+  const summary = boardSummary(tasks, members, budget, parked)
 
   // Diagnostics: capture what this round actually saw, so the status tool can
   // explain "why nothing dispatched" without guesswork.
@@ -507,7 +533,7 @@ export async function tick(
 
   // Last thing in the round, so the line records the state the round produced
   // rather than the one it started from — including the wakes just sent.
-  await recordStatus(config, team)
+  await recordStatus(config, team, state.lastError)
   return breaker
 }
 

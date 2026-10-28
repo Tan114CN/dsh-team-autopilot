@@ -2,7 +2,7 @@
 
 **Deterministic auto-dispatch for the native Agent Teams seam (`ctx.agentTeams`).**
 
-![左边是原生 Agent Teams：任务 ready、两个成员空闲，但没有人被叫醒。右边是同一块板子在插件下一轮的观测：任务出现、唤醒 worker-c、被认领、完成，全程 4 秒，路径中没有任何模型调用。](https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/how-it-works.png)
+![左边是原生 Agent Teams：任务 ready、两个成员空闲，但没有人被叫醒。右边是同一块板子在插件下一轮的观测：任务出现、唤醒 worker-c、被认领、完成，约 2 秒，路径中没有任何模型调用。](https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/how-it-works.png)
 
 上图的右侧不是示意：底部三行是 2026-10-28 真机日志的原样字段，可对照 [真机验证记录](#真机验证记录)。图由 `scripts/render-assets.py` 从这些字段渲染，不是手绘。
 
@@ -60,7 +60,7 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 
 回收带 `expectedRevision` 做 compare-and-set。如果人类 Lead 或主 agent 在同一时刻改了同一个任务，我们这一侧会失败——此时只记录 `lastError`、**不触发熔断**，下一轮重读任务板再判。所以最坏情况是「回收晚一轮生效」，不会写坏状态，也不会连累同一轮还能正常派发的任务。
 
-唯一仍未实测的是 `wait_agent`：从官方描述看它只观察不唤醒，而我们唤醒产生的 activity 变化正是它要等的东西，理论上互补。但「理论上」不等于验证过，见「仍未验证」。
+官方 9 个团队工具里唯一没有实测的是 `wait_agent`：从官方描述看它只观察不唤醒，而我们唤醒产生的 activity 变化正是它要等的东西，理论上互补。但「理论上」不等于验证过，见「仍未验证」。
 
 ### 与模型驱动：时钟互补，不是竞争
 
@@ -68,7 +68,7 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 
 真正的价值是时钟不同源：它的检查节奏绑在主 agent 的 step loop 上（主 agent idle、等用户、被 interrupt 时都不检查），而官方那条限制 `Task readiness never starts an owner` 描述的恰恰是没有活跃主 agent 的时刻。两者覆盖的是不同时间段，可以都装。
 
-如果一起装，建议把 `wakeCooldownMs` 调大（默认 60s）。它按「任务 × 成员」去重，能减少主 agent 自己派活时与 tick 的重复唤醒。
+如果一起装，建议把 `wakeCooldownMs` 调大（默认 60s）。它按**任务**去重——同一个任务在一个窗口内最多被唤醒一次（换人唤醒要等窗口过去），能减少主 agent 自己派活时与 tick 的重复唤醒。
 
 > **引用变化（2026-10-28 复核）**：这一节原先用一个具体包做样本，逐字段核对过它的 `inject`、注册的工具名与 channels 默认值。该包**已从 registry 下架**（`npm view` 返回 404），那些细节因此无法复现，只保留「这一类做法与本插件互补」的结论。要判断某个模型驱动插件能否共存，看它写哪套状态即可：只注入 prompt、不碰任务板 → 可叠加；经自建层改状态（例如 `@nanmicoder/dsh-agent-teams`）→ 互斥。
 
@@ -166,7 +166,7 @@ dsh plugin --profile web add dsh-team-autopilot
 
 回收发生在派发之前，释放的槽位同一轮即可再用。同一轮内，刚被回收的任务不会派回刚被剥夺的那个成员——否则会形成「僵死 → 回收 → 还给他 → 再僵死」的循环。
 
-**回收有上限，到点就停派。** 回收一个僵死的 owner 是对的，无限回收不是：任务回池 → 下一个成员认领 → 同样安静地停下，每圈一次模型唤醒。真机上这发生过——二十分钟里同一任务被回收 12 次、派发 19 次、`done` 始终为 0。所以按任务记回收次数，达到 `reclaimRetryLimit`（默认 3）就不再为它唤醒任何人，日志写 `park=task-1<scope-a after=3`、`why=parked`，状态工具里逐条列出 `parked task=... after=N reclaims lastOwner=...`。**这只停派发，不动任务板**：任务仍是 `claimable`，Lead 或人类随时可以自己认领，一旦被"别人"接手、完成或从板上消失，停派记录即清除（重启插件也会清空，这就是人工放行的路径）。一个任务反复回来不是缺槽位，是没人能做完它——这是判断，不是再一次唤醒。
+**回收有上限，到点就停派。** 回收一个僵死的 owner 是对的，无限回收不是：任务回池 → 下一个成员认领 → 同样安静地停下，每圈一次模型唤醒。真机上这发生过——二十分钟里同一任务被回收 12 次、派发 19 次、`done` 始终为 0。所以按任务记回收次数，达到 `reclaimRetryLimit`（默认 3）就不再为它唤醒任何人，日志写 `parks=task-1<scope-a after=3`、`why=parked`，状态工具里逐条列出 `parked task=... after=N reclaims lastOwner=...`。**这只停派发，不动任务板**：任务仍是 `claimable`，Lead 或人类随时可以自己认领，一旦被"别人"接手、完成或从板上消失，停派记录即清除（重启插件也会清空，这就是兜底放行路径）。一个任务反复回来不是缺槽位，是没人能做完它——这是判断，不是再一次唤醒。
 
 ## 构建
 
@@ -181,7 +181,7 @@ npm run build        # tsdown → dist/index.mjs + dist/index.d.mts
 ```bash
 npm run verify:pack     # 打包内容断言（不落盘）
 npm publish --dry-run   # 走一遍 prepublishOnly + prepack，看清最终清单
-npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型检查与两套测试
+npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型检查 + verify + integration + verify:status
 ```
 
 - `dist/` 被 `.gitignore` 忽略，但 `prepack` 会在打包前强制重建，所以**从干净检出发布也安全**。
@@ -192,9 +192,9 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 46 checks passed
+node tests/verify.ts                            # → OK — 50 checks passed
 node tests/integration.ts                       # → OK — 29 integration checks passed
-node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
+node scripts/acceptance.mjs                     # → ✅ 全部通过 — 28/28 项验收通过
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
 ```
@@ -204,7 +204,7 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：`devDependencies` 钉住 `0.2.1-rc.2`，代码逐条对过它的 `.d.ts`；`peerDependencies` 写的是范围 `>=0.2.1-rc.2 <0.3.0`，会自动接受后续 rc（上游现在 `next` 是 `0.2.1-rc.4`），但没有逐个 rc 复核过——升级 rc 时请重跑 `tsc` 与 `npm test`。
-- **零依赖自检**：`tests/verify.ts` 的 46 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
+- **零依赖自检**：`tests/verify.ts` 的 50 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
 - **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，29 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖、回收达到上限后停派、宿主异常后循环保活、裁剪失败退避、状态写入超时，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
 ## 开发环境注意事项
@@ -263,7 +263,7 @@ dsh web
 
 在 DeepSeek Harness 桌面版 `0.2.1-rc.3` 上（`dryRun: true`）实测：
 
-- 写域冲突拦截：被跳过的任务计入 `skipped`（现在是 `scope` / `noMember` / `declined` 三项，当时只有 `lastBlocked=1`）——task-2 被 in_progress 的 task-1 挡住
+- 写域冲突拦截：被跳过的任务计入 `skipped`（现在是 `scope` / `noMember` / `declined` / `parkedSkips` 四类，当时只有 `lastBlocked=1`）——task-2 被 in_progress 的 task-1 挡住
 - 正路径派发：`dispatched=1`（task-3 派给 idle 成员）
 - 冷却去重：`suppressed=2`
 - 诊断：`team=session-… tasks=3 inFlight=1 claimable=2 idle=1 slots=1`
@@ -304,9 +304,9 @@ dsh web
 
 | 时刻 | 事件 | 字段 |
 |---|---|---|
-| `ticks=9` | 第 1 次回收 | `reclaim=task-1<stall-a` → 派给 `stall-b` |
-| `ticks=23` | 第 2 次回收 | `reclaim=task-1<stall-b` → 派回 `stall-a` |
-| `ticks=29` | **第 3 次回收 → 停派** | `parked=1`、`park=task-1<stall-a after=3`、`why=parked` |
+| `ticks=9` | 第 1 次回收 | `reclaims=task-1<stall-a` → 派给 `stall-b` |
+| `ticks=23` | 第 2 次回收 | `reclaims=task-1<stall-b` → 派回 `stall-a` |
+| `ticks=29` | **第 3 次回收 → 停派** | `parkedSkips=1`、`parks=task-1<stall-a after=3`、`why=parked` |
 | `ticks=29` 之后 | **彻底安静** | `dispatched` 冻结在 2，无任何新行 |
 
 三圈 `stall-a → stall-b → stall-a` 的空转，到第 3 次回收戛然而止。逐项对上设计：
@@ -316,12 +316,12 @@ dsh web
 - **停派后日志安静**：`dispatched` 冻结、无新行，正是「看得见地停下」而非「看不见地一直试」。
 - **判定没被「刚认领过」干扰**：第 3 次回收前 `stall-a` 又认领了一次（`wake=task-1>stall-a outcome=claimed`），但没再干活，停派照常触发。
 
-status 里逐条列出 `parked task=task-1 after=3 reclaims lastOwner=stall-a`，与日志 `park=task-1<stall-a after=3` 同词同值。
+status 里逐条列出 `parked task=task-1 after=3 reclaims lastOwner=stall-a`，与日志 `parks=task-1<stall-a after=3` 同词同值。
 
 ### 真机顺带发现的两条行为
 
 1. **成员 spawn 后立刻跑一个回合，并会主动扫任务板认领 ready 任务**——成员侧天然存在模型驱动派发。但它只在 spawn 首回合（或被唤醒时）发生；**新建任务本身不会触发任何成员**，与官方「Task readiness never starts an owner」一致。造僵死场景时必须先把多余成员冻结，否则任务会被吃掉。
-2. **回池后若无人认领，autopilot 会周期性重复唤醒**：本轮观测到 `dispatched 1→3`、`suppressed 0→5`。`wakeCooldownMs` 按「任务 × 成员」去重，所以每个成员每窗口最多一次——不算刷屏，但任务长期滞留在池中时会持续产生唤醒消息。
+2. **回池后若无人认领，autopilot 会周期性重复唤醒**：本轮观测到 `dispatched 1→3`、`suppressed 0→5`。`wakeCooldownMs` 按**任务**去重，所以同一个任务每窗口最多被唤醒一次——不算刷屏，但任务长期滞留在池中时会持续产生唤醒消息。
 
 ## 仍未验证
 
@@ -340,7 +340,7 @@ autopilot active
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N parked=N
 caller team=<id> tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (live)
 teams=N
-  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N parked=N) why=<a,b|-> breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
+  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N parkedSkips=N) why=<a,b|-> breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
@@ -351,7 +351,7 @@ teams=N
 
 | 字段 | 回答什么 | 为什么必须有 |
 |---|---|---|
-| `skipped (scope=N noMember=N declined=N parked=N)` | 任务为什么没派出去 | 四种原因四种处置：写域冲突要放宽写域、没有空闲成员要加人、全员拒绝要看成员为什么不接、**回收太多次已停派**要看任务为什么没人能做完。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
+| `skipped (scope=N noMember=N declined=N parkedSkips=N)` | 任务为什么没派出去 | 四种原因四种处置：写域冲突要放宽写域、没有空闲成员要加人、全员拒绝要看成员为什么不接、**回收太多次已停派**要看任务为什么没人能做完。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
 | `lastReclaim`（task / from / reason / 时刻） | 刚刚收回的是哪个任务、从谁手里、为什么 | 只有 `reclaimed=2` 时，判断「是不是同一个任务在循环」只能靠任务的 revision 数字往上爬来反推 |
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
@@ -384,11 +384,11 @@ team-autopilot:
   statusFile: C:/Users/you/.dsh/profiles/desktop/team-autopilot.log
 ```
 
-只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记。累计跳过计数（`skip` / `scope` / `noMember` / `declined`）不参与比较——它们每轮都在涨，算作变化就等于逐轮写；本轮的原因 `why` 参与比较，所以「开始被写域挡住」「全员拒接后停手」仍会立刻写一行：
+只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记。累计跳过计数（`skip` / `scope` / `noMember` / `declined` / `parkedSkips`）和冷却/熔断累计（`suppressed` / `held`）不参与比较——它们每轮都在涨，算作变化就等于逐轮写；本轮的原因 `why` 和事件（`reclaims=` / `parks=` / `unparks=`）参与比较，所以「开始被写域挡住」「全员拒接后停手」「停派又被解除」仍会立刻写一行：
 
 ```
-2026-10-28T11:33:10.805Z autopilot-start version=0.3.5 tickMs=30000 wakeMs=60000 reclaimMs=60000 heartbeatMs=600000 dryRun=false
-2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 why=declined unclaimed=2 pending=0 reclaimed=0 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
+2026-10-28T11:33:10.805Z autopilot-start version=0.3.9 tickMs=30000 wakeMs=60000 reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3
+2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 parkedSkips=0 why=declined unclaimed=2 pending=0 reclaimed=1 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 sent=1 outcome=unclaimed reclaims=task-3<worker-a reclaimed
 ```
 
 单行是刻意的：`tail -1` 是当前状态，`tail -30` 是最近历史，`grep -c` 数得出重复次数。多行美化版必须整份读完才有用，那对日志等于永远不会被读。
@@ -411,12 +411,12 @@ grep 'autopilot-start' team-autopilot.log       # 每次重启：哪个版本、
 
 所以 `tasks=4 inFlight=0 claimable=0` 这种「看着该派却派不出去」的谜面，配上 `blocked=2 done=2` 就直接变成答案——不需要再回一轮对话去问。
 
-- **启动标记行**：每次进程启动写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… retryLimit=… heartbeatMs=… dryRun=…`。没有它，重启后「跑的是不是新版本、配置生效了没」只能靠猜；`ticks=1` 虽然也能当重启标记，但说不出跑的是哪个 build
-- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写。比较时**不看累计跳过计数**（`skip` / `scope` / `noMember` / `declined` / `parked`）：任务一直没人接时它们每轮都在涨，算作变化就等于逐轮写——`0.3.4` 之前就是这样，有 `declined` 的团队日志会退化回每 tick 一行。**但 `park=` 事件算变化**：停派一个任务是要人接手的事，不能等到心跳才看得见
+- **启动标记行**：每次进程启动写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… retryLimit=… reclaimOnFailed=… heartbeatMs=… dryRun=… maxConcurrent=… errorThreshold=…`。没有它，重启后「跑的是不是新版本、配置生效了没」只能靠猜；`ticks=1` 虽然也能当重启标记，但说不出跑的是哪个 build、用了哪套配置
+- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写。比较时**不看累计跳过计数**（`skip` / `scope` / `noMember` / `declined` / `parkedSkips`）和冷却/熔断累计（`suppressed` / `held`）：任务一直没人接时它们每轮都在涨，算作变化就等于逐轮写——`0.3.4` 之前就是这样，有 `declined` 的团队日志会退化回每 tick 一行。**但事件（`parks=` / `unparks=` / `reclaims=`）算变化**：停派、解除停派一个任务都是要人接手的事，不能等到心跳才看得见
 - 默认**关闭**，仓库模板也不开——插件不主动往磁盘写东西
 - 写入失败一律静默：观测是便利，满盘或只读 profile 不能卡住派发
 - **熔断打开导致这一轮没派发时也会写**——那正是最该看日志的时刻，静默等于在最需要的时候失声
-- 超过 128 KB 自动裁掉前半，保留尾部；裁剪走「写临时文件 + 原子 rename」，进程在裁剪中途死掉也不会留下半个日志
+- 超过 128 KB 自动裁掉前半、保留尾部，同时保留最近一条启动标记行（`autopilot-start … (trimmed)`），所以裁剪后版本/配置仍可 grep；裁剪走「写临时文件 + 原子 rename」，进程在裁剪中途死掉也不会留下半个日志
 - `dryRun` 下照写，回收记为 `reclaim-dry-run`——要看的是判定，不是副作用
 - **已知限制**：单进程内所有写入都是 `await` 串行的，安全；但如果同一个 profile 同时跑桌面 App 和一个 `dsh` CLI 会话，两个进程共写同一文件时，裁剪那一步的读-改-写不是跨进程安全的，理论上会吞掉对方刚追加的行。用一个专属的 `statusFile` 路径即可避开
 

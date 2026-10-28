@@ -237,6 +237,33 @@ export interface TeamState {
   lastStatusSignature: string | undefined
   /** Epoch milliseconds of the last written status line, if any. */
   lastStatusAt: number | undefined
+  /**
+   * Reclaims performed this round, as `taskId<previousOwner`, in order.
+   *
+   * A single `lastReclaim` can only remember one release, so a round that
+   * reclaimed three stalled owners used to log only the last. This array keeps
+   * every release of the round so the log says *which* tasks came back, not
+   * just that some did. Cleared at the start of each round.
+   */
+  reclaimsThisRound: string[]
+  /**
+   * Parks performed this round, as `taskId<previousOwner`, in order.
+   *
+   * The same single-record problem as {@link reclaimsThisRound}: a round that
+   * parked two tasks logged only the last. Kept as an array for the log.
+   * Cleared at the start of each round.
+   */
+  parksThisRound: string[]
+  /**
+   * Unparks performed this round, as bare task ids, in order.
+   *
+   * Unparking was previously invisible: the event line only fired while the
+   * park was live, so the round that cleared it changed nothing and the log
+   * never said "this task is offered again". This array makes the stand-off
+   * ending as newsworthy as the one beginning. Cleared at the start of each
+   * round.
+   */
+  unparksThisRound: string[]
 }
 
 /** Autopilot-wide observable state. */
@@ -306,6 +333,9 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     pendingWakes: new Map(),
     lastStatusSignature: undefined,
     lastStatusAt: undefined,
+    reclaimsThisRound: [],
+    parksThisRound: [],
+    unparksThisRound: [],
   }
   state.teams.set(team, created)
   return created

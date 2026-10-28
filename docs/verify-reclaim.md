@@ -9,14 +9,14 @@
 `team_autopilot_status` 输出里有两处 `reclaimed`：
 
 ```
-totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
+totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N parked=N
   team=<id> ... reclaimed=N unclaimed=N pending=N
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
 
-- 第一处是全局累计，第二处是按团队（多团队时逐个打印）
-- `lastError` 非空 = 上一次 `reassign` 调用失败（revision 冲突最常见），**不熔断**，下一轮会重读重试
+- 第一处是全局累计，第二处是按团队（多团队时逐个打印）；`totals` 里的 `parked=N` 是**当前停派任务数**，团队行括号里的 `parkedSkips=N` 才是**累计因停派而跳过**的次数
+- `lastError` 非空 = **最近一次宿主调用失败**（`reassign` / `sendWake` / `waitForChange` / tick 抛错都写这里，revision 冲突最常见），**不熔断**，下一轮会重读重试；要看是哪类调用失败，配合 `lastReclaim` / `lastDispatch` 判断来源
 - `outcome=unchecked` 表示**还没到判定时刻**（判定要等 `wakeCooldownMs` 到期），不是「没认领」；配合 `pending=N` 看还有几条在等判定。回收场景里它很常见：任务刚被重新派出去，判定还在冷却窗口内
 
 **判定时务必同时看 `lastReclaim`**：`reclaimed` 只回答「几次」，`lastReclaim` 回答「哪个任务、从谁手里、为什么」。回收循环（同一任务被反复收回）只有后者能看出来——否则只能盯着任务 revision 往上爬来推断。
@@ -123,12 +123,12 @@ tick 由 `waitForChange(lead, tickTimeoutMs, signal)` 驱动：有团队变化�
 | `reclaimed` 涨了但任务没回池 | `reassign` 失败（多为 revision 冲突） | 看 `lastError`；下一轮会重读重试 |
 | `reclaimed` 涨了但 breaker 也开了 | 两者独立——**回收失败不会触发熔断** | 属预期；熔断只由 `sendMessage` 连续失败驱动 |
 | 回收后任务又派回 A | `previousOwner` 避让失效 | 记下 status 全文与日志，是 bug |
-| `reclaimed` 一直涨、`done` 不动 | 任务被反复回收重派（`< 0.3.7` 无终点，真机 20 分钟回收 12 次 / 派发 19 次） | 升到 `0.3.7`：达到 `reclaimRetryLimit`（默认 3）后停派，日志出现 `park=<任务><owner> after=N`、`why=parked` |
+| `reclaimed` 一直涨、`done` 不动 | 任务被反复回收重派（`< 0.3.7` 无终点，真机 20 分钟回收 12 次 / 派发 19 次） | 升到 `0.3.7`：达到 `reclaimRetryLimit`（默认 3）后停派，日志出现 `parks=<任务><owner> after=N`、`why=parked` |
 
 ## 10. 已知限制（验证时别当成 bug）
 
-1. **stalled 表在内存**：插件重启后所有任务的 grace 期重新计时。回收计数与停派集合同样在内存，重启即清零——这也是目前放停派任务的唯一路径。
-2. **回收有终点（≥0.3.7）**：同一任务被回收达到 `reclaimRetryLimit`（默认 3）后不再为它唤醒任何人，进 `parked` 集合，日志 `park=… after=N`、status 里逐条列出。**只停派发、不动任务板**：任务仍是 `claimable`，人或 Lead 认领 / 完成 / 删除它之后记录即清除。这是判断不是唤醒——反复回来说明没人能做完它，再派一次只是再烧一次 token。已真机实证（2026-10-28，0.3.7）：两个停手成员 `stall-a` / `stall-b` 让任务空转，`ticks=9/23/29` 三圈回收后 `park=task-1<stall-a after=3`、`why=parked`，`dispatched` 冻结、日志安静。
+1. **stalled 表在内存**：插件重启后所有任务的 grace 期重新计时。回收计数与停派集合同样在内存，重启即清零——停派的常规解除路径是认领 / 完成 / 删除（见下一条），重启是兜底。
+2. **回收有终点（≥0.3.7）**：同一任务被回收达到 `reclaimRetryLimit`（默认 3）后不再为它唤醒任何人，进 `parked` 集合，日志 `parks=… after=N`、status 里逐条列出。**只停派发、不动任务板**：任务仍是 `claimable`，人或 Lead 认领 / 完成 / 删除它之后记录即清除。这是判断不是唤醒——反复回来说明没人能做完它，再派一次只是再烧一次 token。已真机实证（2026-10-28，0.3.7）：两个停手成员 `stall-a` / `stall-b` 让任务空转，`ticks=9/23/29` 三圈回收后 `parks=task-1<stall-a after=3`、`why=parked`，`dispatched` 冻结、日志安静。
 3. **拒绝记录是任务级，不是成员级**：某任务派给某成员未被认领后，该成员在这**一个**任务上被跳过，其它任务照常派给它。若它对所有任务都不接，那些任务会各自停派（`declined` 上涨 + note 行），要恢复得让任务易手。此前「任务回池后被反复派回同一成员」的循环（真机撞到：task-3 的 revision 从 3 爬到 20，约 8–9 轮）已由此消除；循环期间仍可用 `unclaimed` / `lastDispatch wakes=N` / `lastReclaim` 三条互相印证。
 4. **回收失败不熔断**：只写 `lastError`，下一轮重试。
 

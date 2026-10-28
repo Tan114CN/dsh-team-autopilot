@@ -62,11 +62,17 @@ export function startupLine(at: number, config: Required<Config>): string {
     `wakeMs=${config.wakeCooldownMs}`,
     `reclaimMs=${config.reclaimAfterMs}`,
     // How many times a task may come back before it is parked. Printed with
-    // the rest of the settings because a `park=` in the log is unreadable
+    // the rest of the settings because a `parks=` in the log is unreadable
     // without the limit that produced it.
     `retryLimit=${config.reclaimRetryLimit}`,
+    `reclaimOnFailed=${config.reclaimOnFailed}`,
     `heartbeatMs=${config.statusHeartbeatMs}`,
     `dryRun=${config.dryRun}`,
+    // The concurrency ceiling and the breaker trip threshold round out "which
+    // settings": without them a `slots=` or a `breaker=open` in the log is a
+    // number with no origin, and a restart is exactly when those change.
+    `maxConcurrent=${config.maxConcurrent}`,
+    `errorThreshold=${config.errorThreshold}`,
   ].join(' ')
 }
 
@@ -88,9 +94,13 @@ const MAX_BYTES = 128 * 1024
  * read in full to be useful, which for a log means never.
  * @param team - that team's bucket, already updated for this tick.
  * @param at - epoch milliseconds of the tick.
+ * @param lastError - the loop's most recent error, if any. Surfaced so a
+ *   failing round is not indistinguishable from an idle one: "nothing was
+ *   dispatched" and "every attempt threw" produce the same board numbers, and
+ *   only the error tells them apart.
  * @returns the line, without a trailing newline.
  */
-export function statusLine(team: TeamState, at: number): string {
+export function statusLine(team: TeamState, at: number, lastError?: string): string {
   const parts = [
     new Date(at).toISOString(),
     `team=${team.team}`,
@@ -105,7 +115,10 @@ export function statusLine(team: TeamState, at: number): string {
     // four numbers together say which fix applies, and a task that keeps
     // coming back is the one cause a reader cannot diagnose from a single
     // round. The *current* parked tasks are announced as an event below.
-    `parked=${team.skippedParked}`,
+    // Named `parkedSkips` (not `parked`) to keep it distinct from the two
+    // other meanings of "parked" in the wider report: the `park=` event line
+    // and the totals `parked=` (currently-parked task count).
+    `parkedSkips=${team.skippedParked}`,
     // Why this round skipped anything, deduplicated. `-` rather than omitting
     // the field: "nothing was skipped" is a fact a reader needs, and an absent
     // key is indistinguishable from an older build.
@@ -134,17 +147,37 @@ export function statusLine(team: TeamState, at: number): string {
       : dispatch.claimed ? 'claimed' : 'unclaimed'
     parts.push(`wake=${dispatch.taskId}>${dispatch.memberName}`)
     parts.push(`wakes=${dispatch.repeats}`)
+    // `sent` distinguishes a real wake from a dry-run decision. Under dryRun
+    // `dispatched` still climbs and `sent` stays 0, and without this field the
+    // two rounds are byte-for-byte identical — a reader cannot tell "message
+    // left the process" from "the decision was logged only".
+    parts.push(`sent=${dispatch.sent ? 1 : 0}`)
     parts.push(`outcome=${outcome}`)
   }
-  const reclaim = team.lastReclaim
-  if (reclaim !== undefined) {
-    parts.push(`reclaim=${reclaim.taskId}<${reclaim.previousOwner}`)
-    parts.push(reclaim.applied ? 'reclaimed' : 'reclaim-dry-run')
+  // Reclaims and parks are this round's *events*, not a single "last one".
+  // The arrays say everything that happened this round: a round that reclaimed
+  // three owners or parked two tasks logs all of them, in order, instead of
+  // silently dropping all but the last. The `applied`/dry-run split still
+  // comes from `lastReclaim` — it is the one piece the array cannot carry.
+  if (team.reclaimsThisRound.length > 0) {
+    parts.push(`reclaims=${team.reclaimsThisRound.join(',')}`)
+    const last = team.lastReclaim
+    if (last !== undefined) parts.push(last.applied ? 'reclaimed' : 'reclaim-dry-run')
   }
-  const park = team.lastPark
-  if (park !== undefined && team.parked.has(park.taskId)) {
-    parts.push(`park=${park.taskId}<${park.previousOwner}`)
-    parts.push(`after=${park.reclaims}`)
+  if (team.parksThisRound.length > 0) {
+    parts.push(`parks=${team.parksThisRound.join(',')}`)
+    const last = team.lastPark
+    if (last !== undefined) parts.push(`after=${last.reclaims}`)
+  }
+  if (team.unparksThisRound.length > 0) {
+    parts.push(`unparks=${team.unparksThisRound.join(',')}`)
+  }
+  // The error goes last and only when present: its presence *is* the signal,
+  // and a constant `err=-` would both bloat every line and read as "all good"
+  // when it means nothing. Collapse whitespace and cap at 120 chars so one
+  // host error cannot smear across the line or grow the log without bound.
+  if (lastError !== undefined && lastError !== '') {
+    parts.push(`err=${lastError.replace(/\s+/g, ' ').slice(0, 120)}`)
   }
   return parts.join(' ')
 }
@@ -170,7 +203,7 @@ export function statusSignature(line: string): string {
     // quiet log — one whose work is stuck — and quietly turn the heartbeat
     // back into a per-tick write. The totals stay in the line for whoever
     // reads it; they just do not make a round newsworthy on their own.
-    .replace(/\s(?:skip|scope|noMember|declined|parked|suppressed|held)=\d+/g, '')
+    .replace(/\s(?:skip|scope|noMember|declined|parkedSkips|suppressed|held)=\d+/g, '')
 }
 
 /**
@@ -241,7 +274,17 @@ export async function appendStatusLineWith(
     const lines = (await fs.read(path)).split('\n')
     // Keep the trailing half: the newest rounds are the ones worth reading,
     // and halving avoids re-trimming on the very next append.
-    const kept = lines.slice(Math.floor(lines.length / 2)).join('\n')
+    const tail = lines.slice(Math.floor(lines.length / 2))
+    // The boot marker is the one line that must survive every trim: it names
+    // the build and settings, and ops tooling (`docs/verify-host.md`) greps it
+    // to tell "restarted" from "stale" and "old build" from "current". Halving
+    // alone drops it forever the first time the log passes its ceiling, which
+    // then reads as "never booted / old version". Prepend the most recent
+    // startup line so it stays discoverable without pinning it to the front.
+    const boot = [...lines].reverse().find(line => line.startsWith('autopilot-start '))
+    const kept = (boot === undefined ? [] : [`${boot} (trimmed)`])
+      .concat(tail)
+      .join('\n')
     // Write aside and rename: a truncating write leaves a half-written log if
     // the host dies mid-trim, and the log is often the only thing left to read
     // after a crash. Rename replaces the file atomically within one volume.

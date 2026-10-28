@@ -54,19 +54,19 @@ bundle 的组合只在 App 启动时进行，**关窗口 ≠ 退出**。
 在会话里让模型调用工具 **`team_autopilot_status`**。期望返回类似：
 
 ```
-autopilot inactive
+autopilot dry-run
 totals rounds=0 dispatched=0 suppressed=0 skipped=0 unclaimed=0 reclaimed=0 parked=0
 caller team=session-… tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (live)
 teams=1
-  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0 parked=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 pending=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
+  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0 parkedSkips=0) why=- breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 pending=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
     lastReclaim none
     lastDispatch none
 ```
 
-- `inactive` 是因为 `dryRun: true`（`enabled` 仍为 `true`），**但计数会随轮次增长**，这是正常的。
+- `dry-run` 是因为 `dryRun: true`（`enabled` 仍为 `true`，但只记录判定、不真发消息），**但计数会随轮次增长**，这是正常的。三态：`inactive`（未启用）/ `dry-run`（启用但只记不发）/ `active`（正常派发）。
 - `caller` 一行是**调用方自己团队**的实时板（live），`team=` 那行是 autopilot 上次 tick 的快照并带年龄——两者数值不一致是正常的。
-- `skipped` 后面的 `(scope / noMember / declined / parked)` 是跳过原因拆分：写域冲突 / 没有空闲成员 / 空闲成员全都拒绝过这个任务 / **回收太多次已被停派**。前三个是「这一轮为什么没派」，第四个是「这个任务已经不派了」——要看具体是哪几个任务，用 status 工具，它把 `parked` 逐条列出（`task` / `after` / `lastOwner`）。
-- `tasks` 是**四分桶，恒等于总数**：`inFlight + claimable + blocked + done == tasks`。`blocked` 是卡在依赖上的（`pending` 未 `ready` 且无 owner），`done` 是 `completed`/`deleted`。所以「4 个任务、0 可派、2 个空闲」能立刻区分出是卡依赖还是活已干完。
+- `skipped` 后面的 `(scope / noMember / declined / parkedSkips)` 是跳过原因拆分：写域冲突 / 没有空闲成员 / 空闲成员全都拒绝过这个任务 / **回收太多次已被停派**。前三个是「这一轮为什么没派」，第四个是「这个任务已经不派了」——要看具体是哪几个任务，用 status 工具，它把 `parked` 逐条列出（`task` / `after` / `lastOwner`）。
+- `tasks` 是**五分桶，恒等于总数**：`inFlight + claimable + parked + blocked + done == tasks`。`blocked` 是卡在依赖上的（`pending` 未 `ready` 且无 owner），`done` 是 `completed`/`deleted`。所以「4 个任务、0 可派、2 个空闲」能立刻区分出是卡依赖还是活已干完。
 - `lastReclaim none` / `lastDispatch none` 是**「还没发生过」**，不是字段缺失。空行与「这版不会报这个字段」在读的人眼里一样，所以显式打 `none`。
 - 若模型说"没有这个工具" → 插件未加载，跳到 2.4。
 
@@ -77,9 +77,9 @@ teams=1
 - 每次**进程启动**写一行 `autopilot-start`，带版本号和生效配置
 - 团队的**字段有变化**时立即写
 - **没有变化**时只在 `statusHeartbeatMs`（默认 10 分钟）到期时写一行心跳
-- **累计跳过计数不算变化**：`skip` / `scope` / `noMember` / `declined` / `parked` 是累计值，任务一直没人接时它们每轮都在涨，若算作变化就等于逐轮写。`< 0.3.4` 正是栽在这里——只要团队里有被拒过一次的任务，日志就会退化回每 tick 一行
+- **累计跳过计数不算变化**：`skip` / `scope` / `noMember` / `declined` / `parkedSkips` 是累计值，任务一直没人接时它们每轮都在涨，若算作变化就等于逐轮写。`< 0.3.4` 正是栽在这里——只要团队里有被拒过一次的任务，日志就会退化回每 tick 一行。冷却/熔断累计 `suppressed` / `held` 同理
 - **但本轮原因 `why` 算**：计数不进比较，原因进。从 `why=-` 变成 `why=scope`，或变成 `why=declined`（全员拒接、插件就此停手），都会立即写一行，不必等心跳——这是「安静」和「瞎」的分界
-- **`park=` 事件也算**：停派一个任务是要人接手的事，不能等到心跳才看得见。它由 `park=<任务><上个 owner> after=N` 这一段表达，而这段不进签名比较（`after=` 恒定时不变），所以只会在**刚停派**或**停派集合变化**时出现，不是每轮一行
+- **`parks=` / `unparks=` / `reclaims=` 事件也算**：停派、解除停派、回收一个任务都是要人接手的事，不能等到心跳才看得见。它们由 `parks=<任务><上个 owner> after=N` / `unparks=<任务>` / `reclaims=<任务><上个 owner>` 表达，只会在**本轮发生了这些事件**时出现，不是每轮一行
 
 所以「文件里 10 分钟没有新行」是**按设计在工作**，不代表插件停了。要区分「安静」和「死了」，看有没有下一条心跳：
 
@@ -93,7 +93,7 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 一行长这样（字段与 status 工具同源，顺序固定）：
 
 ```
-2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 parked=0 why=- unclaimed=0 pending=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
+2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 parkedSkips=0 why=- unclaimed=0 pending=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
 ```
 
 读法：
@@ -106,9 +106,9 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 | 有没有派发 | `dispatched=`；配合 `unclaimed=` / `reclaimed=` |
 | 为什么没派 | `why=` 指出本轮原因（`scope` / `noMember` / `declined` / `parked` / `-`），再用 `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 定位到具体任务 |
 | 有几条唤醒还在等判定 | `pending=`。`outcome=unchecked` 只反映**最后一条**唤醒，一轮派两个任务时另一个只能靠 `pending` 看出来 |
-| 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过；`why=parked` → 有任务被回收太多次，已停止派发（同一行会带 `park=<任务><上个 owner> after=N`） |
-| 回收是不是在空转 | `reclaimed=` 一直涨而 `done=` 不动 → 任务被反复回收重派。`< 0.3.7` 没有终点（真机实测 20 分钟回收 12 次、派发 19 次、`done=0`）；现在达到 `retryLimit=`（默认 3）会停派，日志出现 `park=` |
-| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2`；status 的团队对象里没有 `why` → 低于 `0.3.6`；团队行没有 `parked=`、启动行没有 `retryLimit=` → 低于 `0.3.7` |
+| 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过；`why=parked` → 有任务被回收太多次，已停止派发（同一行会带 `parks=<任务><上个 owner> after=N`） |
+| 回收是不是在空转 | `reclaimed=` 一直涨而 `done=` 不动 → 任务被反复回收重派。`< 0.3.7` 没有终点（真机实测 20 分钟回收 12 次、派发 19 次、`done=0`）；现在达到 `retryLimit=`（默认 3）会停派，日志出现 `parks=` |
+| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2`；status 的团队对象里没有 `why` → 低于 `0.3.6`；团队行没有 `parkedSkips=`、启动行没有 `retryLimit=` → 低于 `0.3.7` |
 
 > 写入失败一律静默——观测是便利，满盘或只读 profile 不能卡住派发。所以文件不存在或某段没写，不能反推成「插件没跑」，要用 2.1 的状态工具交叉确认。
 

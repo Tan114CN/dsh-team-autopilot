@@ -199,7 +199,10 @@ export interface StatusReport {
  */
 export function renderReport(report: StatusReport, now: number): string[] {
   const lines: string[] = []
-  lines.push(`autopilot ${report.enabled && !report.dryRun ? 'active' : 'inactive'}`)
+  // Three states, not two: a dry-run deployment is loaded and deciding, just
+  // not sending — rendering it `inactive` makes the health check in
+  // `docs/prompts-reclaim.md` read a live dry-run as "plugin not loaded".
+  lines.push(`autopilot ${report.enabled ? (report.dryRun ? 'dry-run' : 'active') : 'inactive'}`)
   lines.push(`totals rounds=${report.rounds} dispatched=${report.dispatched} suppressed=${report.suppressed} skipped=${report.skipped} unclaimed=${report.unclaimed} reclaimed=${report.reclaimed} parked=${report.parked}`)
   if (report.caller !== undefined) {
     const live = report.caller
@@ -210,7 +213,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
     const age = team.lastTickAt === undefined ? 'never' : `${Math.max(0, now - team.lastTickAt)}ms ago`
     lines.push(
       `  team=${team.team} ticks=${team.ticks} dispatched=${team.dispatched} suppressed=${team.suppressed}`
-      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined} parked=${team.skippedParked})`
+      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined} parkedSkips=${team.skippedParked})`
       // Same word, same `-` for "nothing", so a reader who learned the log line
       // can read this one: the counters are lifetime, `why` is the last round.
       + ` why=${team.why.length === 0 ? '-' : team.why.join(',')}`

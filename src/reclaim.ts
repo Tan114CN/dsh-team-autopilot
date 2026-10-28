@@ -39,6 +39,18 @@ export interface ReclaimTarget {
    * member in the round that reclaimed it.
    */
   readonly previousOwner: string
+  /**
+   * The epoch ms the task was first seen stalled, when the release was a
+   * grace-period expiry.
+   *
+   * Absent for the immediate causes (owner gone, owner failed): those have no
+   * observation window to resume. Present for an inactive owner that outlived
+   * `reclaimAfterMs`. The caller uses it to put the stall stamp back if the
+   * `reassign` write fails — otherwise a failed release resets the grace
+   * period and the task gets a whole fresh `reclaimAfterMs` before the next
+   * attempt, defeating the "retry next round" contract.
+   */
+  readonly sinceAt?: number
   /** Human-readable cause, surfaced in diagnostics. */
   readonly reason: string
 }
@@ -159,6 +171,7 @@ export function planReclaim(input: ReclaimInput): ReclaimResult {
         revision: task.revision,
         reason: `owner "${owner.name}" inactive for ${held}ms`,
         previousOwner: owner.name,
+        sinceAt: since,
       })
     }
   }

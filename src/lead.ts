@@ -34,13 +34,3 @@ export function findLeads(ctx: Context): Agent[] {
   }
   return leads
 }
-
-/**
- * Find one live Team Lead — the first, kept for callers that only need a
- * single authority. Prefer `findLeads` when serving every active Team.
- * @param ctx - host context with `agents` and `agentTeams` available.
- * @returns the first live Lead Agent, or undefined when no Team exists yet.
- */
-export function findLead(ctx: Context): Agent | undefined {
-  return findLeads(ctx)[0]
-}

@@ -5,6 +5,37 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-29
+
+本次是只读审查（致命 1 / 中 24 / 低 24）后的一轮集中修复，覆盖 P1 行为正确性、P2 可观测性、P3 文档同步三档。日志格式有**破坏性变更**（`parked=` → `parkedSkips=`、`reclaim=`/`park=` → `reclaims=`/`parks=`/`unparks=`、新增 `sent=`/`err=`），依赖日志 grep 的运维脚本需同步更新。
+
+### 修复（P1 行为正确性）
+
+- **停派任务不再计入 `claimable`。** `claimable` 之前不排除 `parked`，停派后长期呈现 `claimable>0 / idle>0 / slots>0` 却 `dispatched=0`，排查者会先怀疑成员和槽位。现在 `boardSummary` 把停派任务拆进独立的 `parked` 桶、从 `claimable` 排除，任务桶恒等式变为 `inFlight + claimable + parked + blocked + done === tasks`。
+- **容量满不再吞掉跳过原因。** `planDispatch` 里 `plans.length >= slots` 时 `break`，排在「填满最后一个槽位的任务」之后的停派/写域冲突任务连 `blocked` 都走不到，`why=` 显示「本轮没有原因」。现在容量满只停止派发，继续走完剩余任务并记录各自的原因。
+- **`.` 写域不再 fail-open。** `normalizeScope` 之前把 `.`、`/`、`./` 都归一化成空串，而 `scopesOverlap` 把空串当「未声明」放行——`writeScopes: ['.']` 的全局写任务会与任何任务并行。现在根目录归一化成哨兵 `'.'`，与任何非空 scope 冲突；空串/空白仍是「未声明」、不冲突。
+- **回收写失败不再重置宽限期。** `planReclaim` 在「计划」时就删掉 stall 表条目，`reassign` 失败只 `continue`，下一轮重新计时、默认再等一个 `reclaimAfterMs`。现在释放目标带上观察起点 `sinceAt`，写失败时把时间戳写回 stall 表，下一轮立即重试而非重等整个宽限。
+
+### 改进（P2 可观测性）
+
+- **回收/停派/解除停派改为事件数组。** 原来只播报最后一个 `reclaim`/`park`，一轮回收 3 个只留最后一条，且「解除停派」在日志里完全不可见。现在 `reclaims=` / `parks=` / `unparks=` 按本轮事件数组输出，解除停派与停派一样是新事件。
+- **裁剪保留启动标记行。** 裁剪按「后半」切，第一次触顶就把 `autopilot-start` 启动行永久删掉，`grep` 判「是否重启/版本」失效。现在裁剪时保留最近一条启动行（标 `(trimmed)`）。
+- **日志行输出 `err=`。** 失败轮此前与「没人可派」形状完全相同，`lastError` 只进 status 不进日志。现在 `lastError` 存在时行尾追加 `err=<折叠空白的前 120 字>`。
+- **唤醒段加 `sent=`。** dryRun 下 `dispatched` 照涨、`sent=false`，日志与真实唤醒逐字段相同。现在 `sent=0/1` 区分「消息真离开进程」与「只记判定」。
+- **report 首行三态。** `dryRun` 之前渲染成 `inactive`，健康判据会把它读成「插件没加载」。现在 `inactive` / `dry-run` / `active` 三态。
+- **累计停派计数改名 `parkedSkips=`。** 同一个 `parked=` 承担三种含义（日志累计跳过数、团队行累计跳过数、totals 当前停派任务数），极易误读。现在日志与团队行的累计计数改名 `parkedSkips=`，`totals parked=` 保留「当前停派任务数」，`parks=` 是事件。
+- **启动行补全生效配置。** 新增 `reclaimOnFailed=` / `maxConcurrent=` / `errorThreshold=`，`slots=` / `breaker=open` 这些日志字段从此有据可查。
+
+### 清理
+
+- 删除无调用方的 `findLead` 死导出。
+- `releasedTargets` 循环变量改名 `entry`，消除对 `released` 计数器的遮蔽。
+
+### 测试
+
+- `verify.ts` 46 → 50：新增停派拆桶、容量满记录原因、`.` 写域、`sinceAt` 携带四组断言。
+- 日志相关断言同步新格式（`parks=`/`unparks=`/`reclaims=`/`sent=`/`err=`/`parkedSkips=`）。
+
 ## [0.3.9] - 2026-10-28
 
 ### 修复

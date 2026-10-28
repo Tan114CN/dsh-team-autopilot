@@ -126,12 +126,13 @@ assert.match(text, /totals rounds=0 dispatched=0 suppressed=0 skipped=0/)
 assert.match(text, /caller team=session-team-a .*\(live\)/)
 assert.match(text, /teams=0/)
 
-// A disabled plugin reports itself as inactive, while a dry-run plugin is
-// enabled but not dispatching — the two states are no longer conflated.
+// A disabled plugin reports itself as inactive, a dry-run plugin is enabled
+// but not sending (its own `dry-run` state), and a live plugin is `active` —
+// three distinct states, so a dry-run deployment can never read as "not loaded".
 const dryRun = { ...result, enabled: true, dryRun: true }
 assert.match(
   definition.output.render({}, dryRun).map(b => b.text ?? '').join('\n'),
-  /autopilot inactive/,
+  /autopilot dry-run/,
 )
 const live = { ...result, enabled: true, dryRun: false }
 assert.match(

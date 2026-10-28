@@ -78,11 +78,24 @@ export interface PlanResult {
  * and surrounding slashes drop. Case is folded only on `win32`, where the
  * filesystem is case-insensitive; on POSIX the result stays case-sensitive
  * because `src/Auth` and `src/auth` are genuinely different targets there.
+ *
+ * Two special cases matter because a write-scope soft lock must fail closed,
+ * never open:
+ *  - a scope that resolves to nothing (`''`, `'/'`, `'./'`, `.` only) is the
+ *    **workspace root** — the whole tree. It normalizes to `'.'`, a sentinel
+ *    that is distinct from the empty "unspecified" string, so `writeScopes:
+ *    ['.']` (a global write) collides with *every* concrete scope instead of
+ *    silently running in parallel with them.
+ *  - an empty or blank raw string stays `''`, which `scopesOverlap` reads as
+ *    "unspecified" and never conflicts.
  * @param scope - raw scope declared on a task.
- * @returns comparable scope, possibly empty.
+ * @returns comparable scope: `'.'` for the workspace root, `''` for
+ *   unspecified, otherwise the folded path.
  */
 export function normalizeScope(scope: string): string {
-  const segments = scope.trim().replace(/\\/g, '/').split('/')
+  const trimmed = scope.trim()
+  if (trimmed === '') return ''
+  const segments = trimmed.replace(/\\/g, '/').split('/')
   const stack: string[] = []
   for (const segment of segments) {
     if (segment === '' || segment === '.') continue
@@ -94,6 +107,7 @@ export function normalizeScope(scope: string): string {
     }
     stack.push(segment)
   }
+  if (stack.length === 0) return '.'
   const value = stack.join('/')
   return process.platform === 'win32' ? value.toLowerCase() : value
 }
@@ -113,6 +127,11 @@ export function scopesOverlap(left: string, right: string): boolean {
   const a = normalizeScope(left)
   const b = normalizeScope(right)
   if (a === '' || b === '') return false
+  // The workspace root `'.'` contains every other scope: a task that declares a
+  // global write must not run in parallel with anything, so it conflicts with
+  // any non-empty scope on either side.
+  if (a === '.') return true
+  if (b === '.') return true
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
 }
 
@@ -159,6 +178,8 @@ export interface BoardSummary {
   readonly inFlight: number
   /** Ready, unowned tasks that could be handed out right now. */
   readonly claimable: number
+  /** Ready, unowned tasks the autopilot has parked and will not offer. */
+  readonly parked: number
   /** Unowned, unready tasks: waiting on their dependencies. */
   readonly blocked: number
   /** Tasks that are finished with, one way or the other. */
@@ -176,30 +197,40 @@ export interface BoardSummary {
  * {@link isInFlight}, so a reported `inFlight` and `slots` always match the
  * decision the autopilot actually made.
  *
- * The four task buckets partition the board exactly:
- * `inFlight + claimable + blocked + done === tasks`. That is what makes the
- * numbers diagnostic rather than merely descriptive: "4 tasks, 0 claimable" is
- * a puzzle, while "4 tasks, 2 blocked, 2 done" answers it. `blocked` counts
- * unowned `pending` tasks that are not ready — waiting on a dependency, not on
- * a member.
+ * The task buckets partition the board exactly:
+ * `inFlight + claimable + parked + blocked + done === tasks`. That is what
+ * makes the numbers diagnostic rather than merely descriptive: "4 tasks, 0
+ * claimable" is a puzzle, while "4 tasks, 2 blocked, 2 done" answers it.
+ * `blocked` counts unowned `pending` tasks that are not ready — waiting on a
+ * dependency, not on a member. A parked task is still ready and unowned on the
+ * board, but the autopilot has stopped offering it, so it is split out into
+ * `parked` and excluded from `claimable`: otherwise a reader watching
+ * `claimable>0 / idle>0 / slots>0` with `dispatched=0` would first suspect the
+ * members and the slots, when the real answer is that the task was parked
+ * after repeated reclaims.
  * @param tasks - current board.
  * @param members - current roster.
  * @param maxConcurrent - effective concurrency budget for the team.
+ * @param parked - task ids currently parked, with their reclaim count.
  * @returns the board summary.
  */
 export function boardSummary(
   tasks: readonly TeamTaskView[],
   members: readonly TeamMemberView[],
   maxConcurrent: number,
+  parked?: ReadonlyMap<string, number>,
 ): BoardSummary {
   const inFlight = tasks.filter(isInFlight).length
-  const claimable = claimableTasks(tasks).length
+  const ready = claimableTasks(tasks)
+  const parkedIds = parked === undefined ? new Set<string>() : new Set(parked.keys())
+  const claimable = ready.filter(task => !parkedIds.has(String(task.id)))
   const done = tasks.filter(task => task.status === 'completed' || task.status === 'deleted').length
   return {
     tasks: tasks.length,
     inFlight,
-    claimable,
-    blocked: tasks.length - inFlight - claimable - done,
+    claimable: claimable.length,
+    parked: ready.length - claimable.length,
+    blocked: tasks.length - inFlight - claimable.length - (ready.length - claimable.length) - done,
     done,
     idle: availableMembers(members, tasks).length,
     slots: Math.max(0, maxConcurrent - inFlight),
@@ -328,20 +359,26 @@ export function planDispatch(input: PlanInput): PlanResult {
   const used = new Set<string>()
   const plannedScopes: Array<{ scope: string; taskId: string }> = []
 
-  for (const task of claimableTasks(tasks)) {
-    if (plans.length >= slots) break
-
+  /**
+   * Why one task cannot be handed out this round, or undefined when it can.
+   *
+   * Shared by the capacity-full branch and the normal branch so the two never
+   * disagree about a task's cause. Pure — it reads `input`, `tasks`, `free`,
+   * `used`, and `plannedScopes` and mutates none of them.
+   * @param task - task being evaluated.
+   * @returns the skip cause, or undefined when the task is dispatchable.
+   */
+  const explainSkip = (task: TeamTaskView): BlockedTask | undefined => {
     const reclamations = input.parked?.get(task.id)
     if (reclamations !== undefined) {
       // Waking a member for this again would reproduce the loop that parked
       // it: claim, go quiet, get reclaimed, get woken. The count is part of the
       // reason because "parked" alone does not say how it got there.
-      blocked.push({
+      return {
         taskId: task.id,
         kind: 'parked',
         reason: `parked after ${reclamations} reclaims without progress`,
-      })
-      continue
+      }
     }
 
     const conflict = findScopeConflict(task, tasks)
@@ -351,26 +388,49 @@ export function planDispatch(input: PlanInput): PlanResult {
       const reason = typeof conflict === 'string'
         ? conflict
         : `write scope "${conflict.scope}" already planned for task ${conflict.taskId}`
-      blocked.push({ taskId: task.id, kind: 'scope', reason })
-      continue
+      return { taskId: task.id, kind: 'scope', reason }
     }
 
     const skip = input.avoid?.get(task.id)
-    const member = pickMember(free, used, skip)
-    if (member === undefined) {
+    if (pickMember(free, used, skip) === undefined) {
       // Telling the two causes apart matters: "no idle teammate" is fixed by
       // adding a member, "everyone declined" by looking at why the existing
       // ones stop accepting.
       const hadCandidate = free.some(entry => !used.has(entry.name))
-      blocked.push(hadCandidate
+      return hadCandidate
         ? {
             taskId: task.id,
             kind: 'declined',
             reason: `every idle teammate already declined this task (${[...skip ?? []].join(', ')})`,
           }
-        : { taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' })
+        : { taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' }
+    }
+    return undefined
+  }
+
+  for (const task of claimableTasks(tasks)) {
+    const skip = input.avoid?.get(task.id)
+    // Capacity is full. Stop handing out work — but keep walking the board so
+    // the remaining tasks still record *why* they were not dispatched. A
+    // `break` here used to drop parked and scope-collision tasks that happened
+    // to sit after a task that filled the last slot, so a reader saw
+    // `why=-` (nothing skipped) when in fact the board held parked and
+    // colliding work whose reasons were swallowed by board order.
+    if (plans.length >= slots) {
+      const reason = explainSkip(task)
+      if (reason !== undefined) blocked.push(reason)
       continue
     }
+
+    const reason = explainSkip(task)
+    if (reason !== undefined) {
+      blocked.push(reason)
+      continue
+    }
+
+    const member = pickMember(free, used, skip)
+    // `explainSkip` already returned undefined, so a member exists.
+    if (member === undefined) continue
     used.add(member.name)
 
     plans.push({

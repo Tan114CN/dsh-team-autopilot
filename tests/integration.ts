@@ -233,8 +233,9 @@ await test('logs the breaker opening, then goes quiet while it stays open', asyn
   const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
   assert.equal(lines.length, 1, 'a held counter climbing every round re-opened the log')
   // The single line is still the breaker-trip line; the later rounds that only
-  // bumped `held` did not add a line.
-  assert.match(lines[0] ?? '', /breaker=open trips=1 held=0$/)
+  // bumped `held` did not add a line. The send failure is surfaced via `err=`
+  // so the trip is not a mystery.
+  assert.match(lines[0] ?? '', /breaker=open trips=1 held=0 err=/)
 })
 
 await test('honours the per-team budget keyed by TeamId', async () => {
@@ -393,8 +394,12 @@ await test('parks a task that keeps coming back instead of waking forever', asyn
   assert.equal(team.skippedParked, 1)
   assert.deepEqual(team.skipKinds, ['parked'])
   // Parking is an autopilot decision, never a board edit: the task stays
-  // claimable so the Lead or a human can still pick it up.
-  assert.equal(team.claimable, 1)
+  // claimable so the Lead or a human can still pick it up. But `claimable`
+  // reports what the autopilot will actually hand out, so a parked task is
+  // split out rather than counted as dispatchable — a reader seeing
+  // `claimable>0 / idle>0 / slots>0` with `dispatched=0` would otherwise
+  // suspect the members and slots before the park.
+  assert.equal(team.claimable, 0)
 
   // Round 4: still parked, still silent.
   await tick(ctx, lead, config, state, 'team-1', wake, new Map(), createBreaker(), signal)
@@ -632,7 +637,7 @@ await test('appends one status line per tick to the configured file', async () =
   assert.match(lines[0] ?? '', /team=team-1 ticks=1/)
   assert.match(lines[1] ?? '', /team=team-1 ticks=2/)
   // The wake sent in the first round is still on record in the second line.
-  assert.match(lines[1] ?? '', /wake=t1>alice wakes=1 outcome=(claimed|unchecked|unclaimed)/)
+  assert.match(lines[1] ?? '', /wake=t1>alice wakes=1 sent=1 outcome=(claimed|unchecked|unclaimed)/)
   // A round with no file configured writes nothing at all.
   const silent = freshState()
   await tick(makeCtx(host), lead, baseConfig, silent, 'team-1', new Map(), new Map(), createBreaker(), signal)
@@ -808,7 +813,7 @@ await test('writes a boot marker before the first round', async () => {
   // A restart is otherwise only visible as `ticks=1`, which says nothing about
   // which build came back or which settings it is running with.
   assert.match(lines[0] ?? '', /autopilot-start version=\d+\.\d+\.\d+ /)
-  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 retryLimit=3 heartbeatMs=600000 dryRun=false$/)
+  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3$/)
 })
 
 await test('survives a host exception mid-round instead of exiting the loop', async () => {

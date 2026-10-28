@@ -24,7 +24,7 @@
 
 改完**完全退出 App 再启动**。关窗口不算：`stalled` 表在内存里，不重启就还在用旧的 `reclaimAfterMs`。
 
-> **版本前提**：`reclaim` 以及本文反复用到的 `lastReclaim` / `pending` 字段需要 `0.3.5` 及以上。确认方式是看 `statusFile` 的启动行（`grep autopilot-start | tail -1`），或直接调 `team_autopilot_status` 看首行是不是 `autopilot active`。
+> **版本前提**：`reclaim` 以及本文反复用到的 `lastReclaim` / `pending` 字段需要 `≥0.3.5`。确认方式是看 `statusFile` 的启动行（`grep autopilot-start | tail -1`），或直接调 `team_autopilot_status` 看首行是 `autopilot active` / `autopilot dry-run`（两者都表示插件已加载，区别只在发不发消息；`inactive` 才表示未启用）。
 >
 > **装版本走包管理器，不要手工往 `node_modules` 塞解包目录**：手放的副本不会进 `package.json` 与锁文件，下次 `pnpm install` 直接覆盖掉，还会让 `verify-mount` 的 lockfile 一项长期红灯。命令与两个已知坑见 README「安装」与「真实宿主联调」。
 
@@ -93,7 +93,7 @@
 |---|---|
 | `reclaimed` | ≥ 1（判定发生了） |
 | 任务 status / owner | **不变**（dryRun 下只计数，不发 reassign） |
-| 出现 `autopilot active` | 插件在跑 |
+| 出现 `autopilot dry-run`（dryRun 下）或 `autopilot active`（非 dryRun 下） | 插件在跑 |
 
 如果 `reclaimed` 一直是 0，先看 FAQ，别急着改配置。
 

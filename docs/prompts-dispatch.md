@@ -12,8 +12,8 @@
 
 | 条件 | 怎么确认 |
 |---|---|
-| 插件是 `0.3.5` | 日志里有 `autopilot-start version=0.3.5`；团队行里有 `why=` 与 `pending=` |
-| **不是** dryRun | 启动横幅 `dryRun=false`；`status` 首行是 `autopilot active` |
+| 插件是 `≥0.3.5` | 日志里有 `autopilot-start version=0.3.x`；团队行里有 `why=` 与 `pending=` |
+| **不是** dryRun | 启动横幅 `dryRun=false`；`status` 首行是 `autopilot active`（`dry-run` 是「只记不发」、`inactive` 是「未启用」） |
 | 会话里至少 1 个空闲成员 | `team_autopilot_status` 里 `idle≥1`、`slots≥1` |
 | 任务能真的被执行完 | 写域不要和其它在飞任务重叠，否则会以 `scope` 为由跳过 |
 
@@ -57,7 +57,7 @@
 
 ---
 
-## 没派出去时怎么判（四分桶就是拿来干这个的）
+## 没派出去时怎么判（任务五分桶就是拿来干这个的）
 
 看日志里那几个字段，组合只有一种解释（先看 `why=` 指了哪一类，再用对应的计数确认）：
 
@@ -72,7 +72,7 @@
 
 ---
 
-## P2 · 收尾（把四分桶走完一整圈）
+## P2 · 收尾（把任务五分桶走完一整圈）
 
 ```
 让接手 DISPATCH-TEST-01 的成员把任务做完并 team_task_update 标记 completed，

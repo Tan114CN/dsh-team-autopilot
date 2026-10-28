@@ -517,6 +517,88 @@ test('boardSummary partitions the board into flight, ready, blocked and done', (
   assert.equal(summary.inFlight + summary.claimable + summary.blocked + summary.done, summary.tasks)
 })
 
+test('boardSummary splits a parked task out of claimable', () => {
+  // M1: a parked task is still ready and unowned on the board, but it is not
+  // dispatchable. Reporting it as claimable makes a reader watching
+  // `claimable>0 / idle>0 / slots>0` with `dispatched=0` suspect the members
+  // and slots before the park. It must be split into its own bucket.
+  const board = [
+    task({ id: 't1', status: 'pending', ready: true }),
+    task({ id: 't2', status: 'pending', ready: true }),
+  ]
+  const members = [member('lead', 'running', 'lead'), member('alice', 'inactive')]
+  const parked = new Map([['t1', 3]])
+  const summary = boardSummary(board, members, 2, parked)
+  assert.equal(summary.claimable, 1, 'the parked task is not dispatchable')
+  assert.equal(summary.parked, 1, 'the park is its own bucket')
+  assert.equal(summary.tasks, 2)
+  // The five buckets still partition the board exactly.
+  assert.equal(
+    summary.inFlight + summary.claimable + summary.parked + summary.blocked + summary.done,
+    summary.tasks,
+  )
+})
+
+test('planDispatch still reports why tasks after the last slot were skipped', () => {
+  // M2: a `break` at capacity used to swallow the skip reasons of every task
+  // that sat after the one filling the last slot, so `why=` read "nothing
+  // skipped" while parked/colliding work stood just out of view. Filling the
+  // last slot must stop dispatch, not the walk.
+  const board = [
+    // The only slot goes to this one.
+    task({ id: 't-free', status: 'pending', ready: true }),
+    // This one is parked, but sits after the slot was filled.
+    task({ id: 't-parked', status: 'pending', ready: true }),
+  ]
+  const members = [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')]
+  const result = planDispatch({
+    tasks: board,
+    members,
+    maxConcurrent: 1,
+    parked: new Map([['t-parked', 3]]),
+  })
+  assert.equal(result.plans.length, 1, 'only the free task is dispatched')
+  assert.equal(result.plans[0]?.taskId, 't-free')
+  const parkedSkip = result.blocked.find(entry => entry.taskId === 't-parked')
+  assert.ok(parkedSkip !== undefined, 'the parked task after the last slot still records its reason')
+  assert.equal(parkedSkip.kind, 'parked')
+})
+
+test('a bare dot scope is the workspace root and conflicts with every scope', () => {
+  // M3: `.`, `/`, and `./` used to normalize to the empty "unspecified" string,
+  // so a global-write task (`writeScopes: ['.']`) ran in parallel with anything.
+  // The root must stay distinct from "unspecified" and collide with all scopes.
+  assert.equal(normalizeScope('.'), '.')
+  assert.equal(normalizeScope('/'), '.')
+  assert.equal(normalizeScope('./'), '.')
+  assert.equal(normalizeScope('   '), '', 'blank is still "unspecified"')
+  assert.equal(normalizeScope(''), '')
+  // The root contains everything; a concrete scope contains nothing of the root.
+  assert.equal(scopesOverlap('.', 'src/auth'), true)
+  assert.equal(scopesOverlap('src/auth', '.'), true)
+  assert.equal(scopesOverlap('.', '.'), true)
+  // "unspecified" still never conflicts.
+  assert.equal(scopesOverlap('', 'src/auth'), false)
+})
+
+test('a grace-expiry reclaim carries its observation start', () => {
+  // M7: a failed `reassign` used to reset the grace period, so the task got a
+  // whole fresh `reclaimAfterMs` before the next retry. The release must carry
+  // the stamp so the caller can put it back on a failed write.
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const result = planReclaim({
+    tasks: board,
+    members: [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+    now: 400_000,
+    reclaimAfterMs: 300_000,
+    reclaimOnFailed: true,
+    stalled: new Map([['t1', 10_000]]),
+  })
+  const release = result.releases[0]
+  assert.ok(release !== undefined)
+  assert.equal(release.sinceAt, 10_000, 'the grace-expiry release keeps its observation start')
+})
+
 test('startupLine names the build and the settings it is running with', () => {
   const config = {
     enabled: true,
@@ -536,9 +618,9 @@ test('startupLine names the build and the settings it is running with', () => {
   }
   const line = startupLine(0, config)
   assert.match(line, /^1970-01-01T00:00:00\.000Z autopilot-start /)
-  // The reclaim limit belongs here: a `park=` in the log cannot be read
+  // The reclaim limit belongs here: a `parks=` in the log cannot be read
   // without the limit that produced it, and a restart is when it changes.
-  assert.match(line, /reclaimMs=300000 retryLimit=3 heartbeatMs=600000 dryRun=false$/)
+  assert.match(line, /reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3$/)
   // A restart is only diagnosable if the line says which build came back.
   assert.match(line, /version=\d+\.\d+\.\d+ /)
 })
@@ -672,7 +754,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   }
   const text = renderReport(report, 3_000).join('\n')
   // The skip total is broken down, so the four fixes are told apart.
-  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0 parked=0\)/)
+  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0 parkedSkips=0\)/)
   // The breakdown says where the total came from; `why` says what the last
   // round ran into. Both, because they answer different questions.
   assert.match(text, /why=scope /)
@@ -808,19 +890,20 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   // "Nothing was skipped" is printed as `-` rather than omitted: an absent key
   // reads as an older build, not as good news. The four skip counters sit in
   // one block so the cause is readable without the status tool.
-  assert.match(idle, /declined=1 parked=0 why=- unclaimed=1 /)
+  assert.match(idle, /declined=1 parkedSkips=0 why=- unclaimed=1 /)
   assert.match(idle, /breaker=closed trips=0 held=0$/)
   assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
 
   // An unjudged wake reads "unchecked", never "unclaimed": the instant a wake
   // is sent, an answered and an ignored one are indistinguishable.
   team.lastDispatch = { taskId: 't1', memberName: 'alice', at: 0, repeats: 1, sent: true }
-  assert.match(statusLine(team, 0), /wake=t1>alice wakes=1 outcome=unchecked/)
+  assert.match(statusLine(team, 0), /wake=t1>alice wakes=1 sent=1 outcome=unchecked/)
   if (team.lastDispatch !== undefined) team.lastDispatch.claimed = false
   assert.match(statusLine(team, 0), /outcome=unclaimed/)
 
   // A dry-run reclaim is logged too: what matters is the decision, not the
-  // side effect that followed from it.
+  // side effect that followed from it. Reclaims are the round's events, held
+  // in an array so a round that released several owners logs all of them.
   team.lastReclaim = {
     taskId: 't1',
     reason: 'owner inactive',
@@ -828,7 +911,8 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
     at: 0,
     applied: false,
   }
-  assert.match(statusLine(team, 0), /reclaim=t1<bob reclaim-dry-run$/)
+  team.reclaimsThisRound = ['t1<bob']
+  assert.match(statusLine(team, 0), /reclaims=t1<bob reclaim-dry-run$/)
 
   // The cumulative skip counters sit outside the signature on purpose — a task
   // nobody takes bumps them every round. The *reason* stays inside it: a team
@@ -865,18 +949,24 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   const park = { taskId: 't2', reclaims: 3, previousOwner: 'bob', at: 0 }
   team.parked.set('t2', park)
   team.lastPark = park
+  team.parksThisRound = ['t2<bob']
   const parkedLine = statusLine(team, 0)
-  assert.match(parkedLine, /parked=4 /, 'the cumulative park skips sit with their siblings')
-  assert.match(parkedLine, /park=t2<bob after=3$/)
+  assert.match(parkedLine, /parkedSkips=4 /, 'the cumulative park skips sit with their siblings')
+  assert.match(parkedLine, /parks=t2<bob after=3$/)
   assert.notEqual(
     statusSignature(parkedLine),
     statusSignature(beforePark),
     'a new park is a change',
   )
-  // The announcement is about a *live* park: once the task is unparked the
-  // event line stops claiming it, instead of outliving the condition.
+  // Unparking is now an event of its own, not just the `parks=` line going
+  // away: the round that clears a park logs the task id, so "offered again"
+  // is as visible as "stopped being offered".
+  team.parksThisRound = []
   team.parked.clear()
-  assert.equal(statusLine(team, 0).includes('park='), false, 'an unparked task is not announced')
+  team.unparksThisRound = ['t2']
+  assert.match(statusLine(team, 0), /unparks=t2$/, 'an unparked task is announced')
+  team.unparksThisRound = []
+  assert.equal(statusLine(team, 0).includes('parks='), false, 'a cleared park is not re-announced')
 
   // `suppressed` (cooldown) and `held` (breaker-open) climb every round while
   // their condition holds, so like the skip counters they sit outside the

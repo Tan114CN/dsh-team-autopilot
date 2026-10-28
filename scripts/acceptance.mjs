@@ -120,7 +120,9 @@ console.log('── 场景 2 · 并发预算 ───────────�
   assert('单轮派发 ≤ maxConcurrent=2', plans.length === 2, `plans=${plans.length}`)
   assert('派满 2 个（t1、t2），t3 未派', plans.map(p => p.taskId).sort().join(',') === 't1,t2',
     plans.map(p => p.taskId).join(', '))
-  // 预算满时 planDispatch 直接 break（静默停），t3 既不派发也不进 blocked —— 这是预期语义
+  // 预算满时不再派发，但会继续走完剩余任务——有「原因」（parked / 写域冲突 /
+  // 无人可派）的仍进 blocked，无原因的（t3 这类正常任务）静默停。这里 t3 无
+  // 冲突、有可用成员，所以既不派发也不进 blocked。
   assert('预算满即停：t3 不进 blocked（静默，不误报冲突）', !blocked.some(b => b.taskId === 't3'),
     `blocked=[${blocked.map(b => b.taskId).join(',')}]`)
 }
