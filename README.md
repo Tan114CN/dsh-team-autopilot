@@ -131,6 +131,7 @@ dsh plugin --profile web add dsh-team-autopilot
 | `halfOpenProbe`  | `1`     | 半开阶段允许的探针派发次数               |
 | `reclaimAfterMs` | `300000` | 持有者 `inactive` 持续多久后把任务收回池子（1000–3600000） |
 | `reclaimOnFailed` | `true`  | 持有者 `failed` 时是否立即回收            |
+| `reclaimRetryLimit` | `3`   | 同一任务被回收几次后停止派发（`0` = 不限，0–32）。见第 9 条 |
 | `statusFile`     | `''`    | 状态有变化时追加一行到该文件（绝对路径），空 = 关闭。见下「零 token 观测」 |
 | `statusHeartbeatMs` | `600000` | 状态未变也至少这么久写一行；`0` = 逐轮写 |
 
@@ -164,6 +165,8 @@ dsh plugin --profile web add dsh-team-autopilot
 官方明说「不会自动释放 owner」——成员 inactive、interrupt、进程退出、工作失败都不会释放，任务就永远挂在 `in_progress`，占着写域和并发槽，别人不能认领。回收走 `reassign` 动作且**不指定 owner**：它把任务清回 `pending` 且无主，正好落回 `claimableTasks` 的判定，下一轮由调度器重新挑人，且会再过一遍写域软锁和并发预算。选 `reassign` 而非 `release` 有两个原因：`release` 只认 `in_progress`，覆盖不了「已认领但未开工」的 `pending`；而 `reassign` 是 Lead-only，语义上就是 Lead 在重新分配。三种僵死按确定性递减处理：owner 已不在 roster（立即回收）、owner `failed`（立即，由 `reclaimOnFailed` 控制）、owner `inactive` 超过 `reclaimAfterMs`（给足启动宽限期，避免误伤刚被唤醒还在拉起的成员）。Lead 自己持有的任务一律不动。
 
 回收发生在派发之前，释放的槽位同一轮即可再用。同一轮内，刚被回收的任务不会派回刚被剥夺的那个成员——否则会形成「僵死 → 回收 → 还给他 → 再僵死」的循环。
+
+**回收有上限，到点就停派。** 回收一个僵死的 owner 是对的，无限回收不是：任务回池 → 下一个成员认领 → 同样安静地停下，每圈一次模型唤醒。真机上这发生过——二十分钟里同一任务被回收 12 次、派发 19 次、`done` 始终为 0。所以按任务记回收次数，达到 `reclaimRetryLimit`（默认 3）就不再为它唤醒任何人，日志写 `park=task-1<scope-a after=3`、`why=parked`，状态工具里逐条列出 `parked task=... after=N reclaims lastOwner=...`。**这只停派发，不动任务板**：任务仍是 `claimable`，Lead 或人类随时可以自己认领，一旦被"别人"接手、完成或从板上消失，停派记录即清除（重启插件也会清空，这就是人工放行的路径）。一个任务反复回来不是缺槽位，是没人能做完它——这是判断，不是再一次唤醒。
 
 ## 构建
 
@@ -201,8 +204,8 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：`devDependencies` 钉住 `0.2.1-rc.2`，代码逐条对过它的 `.d.ts`；`peerDependencies` 写的是范围 `>=0.2.1-rc.2 <0.3.0`，会自动接受后续 rc（上游现在 `next` 是 `0.2.1-rc.4`），但没有逐个 rc 复核过——升级 rc 时请重跑 `tsc` 与 `npm test`。
-- **零依赖自检**：`tests/verify.ts` 的 45 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
-- **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，24 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
+- **零依赖自检**：`tests/verify.ts` 的 46 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
+- **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，26 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖、回收达到上限后停派，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
 ## 开发环境注意事项
 
@@ -304,6 +307,7 @@ dsh web
 - 与官方 `wait_agent` 工具共存是否互相干扰
 - 僵死回收的两个触发条件未实证：**owner 离开 roster**（官方 9 个工具没有移除成员的入口，只能靠进程退出或冷恢复失败，难人为制造）与 **owner `failed`**（中等难造）。已实证的是 `inactive` 超时这一条
 - 负向场景「`running` / `provisioning` 持有者不被回收」未在真机跑过（进程内断言全绿）
+- **回收停派（`parked`）未在真机跑过**：修的是真机撞到的循环（`session-7584e46c`，20 分钟 `reclaimed=12` / `dispatched=19` / `done=0`），但修完的版本只跑了进程内断言。要复现得让一个成员认领后持续不干活、且撑过 3 次 `reclaimAfterMs`（默认 60s）
 - 与 `@nanmicoder/dsh-agent-teams` 双调度器并行的实际后果（上面「不要同时装」是源码层推断，未在真机上跑过双装场景）
 
 ## 可观测性：status 字段怎么读
@@ -312,10 +316,10 @@ dsh web
 
 ```
 autopilot active
-totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
+totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N parked=N
 caller team=<id> tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (live)
 teams=N
-  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N) why=<a,b|-> breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
+  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N parked=N) why=<a,b|-> breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
@@ -326,12 +330,13 @@ teams=N
 
 | 字段 | 回答什么 | 为什么必须有 |
 |---|---|---|
-| `skipped (scope=N noMember=N declined=N)` | 任务为什么没派出去 | 三种原因三种处置：写域冲突要放宽写域、没有空闲成员要加人、全员拒绝要看成员为什么不接。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
+| `skipped (scope=N noMember=N declined=N parked=N)` | 任务为什么没派出去 | 四种原因四种处置：写域冲突要放宽写域、没有空闲成员要加人、全员拒绝要看成员为什么不接、**回收太多次已停派**要看任务为什么没人能做完。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
 | `lastReclaim`（task / from / reason / 时刻） | 刚刚收回的是哪个任务、从谁手里、为什么 | 只有 `reclaimed=2` 时，判断「是不是同一个任务在循环」只能靠任务的 revision 数字往上爬来反推 |
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
 | `pending`（当前待判） | 现在有几条唤醒已发出、还没到判定时刻 | `lastDispatch` 只能记住一条；一轮唤醒两个任务时，第二个在 `outcome` 上完全看不见 |
-| `why`（`scope` / `noMember` / `declined`，**本轮**，无跳过时 `-`）| 这一轮为什么跳过 | 前面括号里那三个是**累计**值，任务一直没人接就每轮都涨，回答不了「此刻为什么不动」。`why` 是这一轮的答案，只在原因变化时才变，所以既安静又即时——「全员拒接、插件停手」不用等心跳。日志行与 status 用同一个词，status 里是数组（`["declined","scope"]`，空数组即 `-`） |
+| `why`（`scope` / `noMember` / `declined` / `parked`，**本轮**，无跳过时 `-`）| 这一轮为什么跳过 | 前面括号里那四个是**累计**值，任务一直没人接就每轮都涨，回答不了「此刻为什么不动」。`why` 是这一轮的答案，只在原因变化时才变，所以既安静又即时——「全员拒接、插件停手」不用等心跳。日志行与 status 用同一个词，status 里是数组（`["declined","scope"]`，空数组即 `-`） |
+| `parked`（当前停派条目） | 哪些任务已经不派了、第几次回收时停的、上个 owner 是谁 | 「回收是不是在空转」只看 `reclaimed` 涨不涨看不出来——涨是**正确判定**的结果。停派之后这件事才有终点，且 `parked` 逐条列任务，一眼能看出是同一个任务反复回来，还是一批任务集体没人能做完 |
 
 `outcome` 的判定发生在**唤醒过了冷却窗口之后**，不是下一次读板就判：唤醒发出去的瞬间，成功与「没人接」在观测上完全相同，而成员读消息、调 `team_task_update` 需要时间。真机上变化驱动的轮次可能只隔 1 秒，那时判就等于在判成员的思考时间——曾因此把每一次唤醒都算成未认领、把正在认领的成员记进拒绝集合、把任务改派给同事造成重复劳动。冷却窗口是判定最早的合理时刻：任务在此之前本来也不允许改派给别人。
 
@@ -385,8 +390,8 @@ grep 'autopilot-start' team-autopilot.log       # 每次重启：哪个版本、
 
 所以 `tasks=4 inFlight=0 claimable=0` 这种「看着该派却派不出去」的谜面，配上 `blocked=2 done=2` 就直接变成答案——不需要再回一轮对话去问。
 
-- **启动标记行**：每次进程启动写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… heartbeatMs=… dryRun=…`。没有它，重启后「跑的是不是新版本、配置生效了没」只能靠猜；`ticks=1` 虽然也能当重启标记，但说不出跑的是哪个 build
-- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写。比较时**不看累计跳过计数**（`skip` / `scope` / `noMember` / `declined`）：任务一直没人接时它们每轮都在涨，算作变化就等于逐轮写——`0.3.4` 之前就是这样，有 `declined` 的团队日志会退化回每 tick 一行
+- **启动标记行**：每次进程启动写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… retryLimit=… heartbeatMs=… dryRun=…`。没有它，重启后「跑的是不是新版本、配置生效了没」只能靠猜；`ticks=1` 虽然也能当重启标记，但说不出跑的是哪个 build
+- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写。比较时**不看累计跳过计数**（`skip` / `scope` / `noMember` / `declined` / `parked`）：任务一直没人接时它们每轮都在涨，算作变化就等于逐轮写——`0.3.4` 之前就是这样，有 `declined` 的团队日志会退化回每 tick 一行。**但 `park=` 事件算变化**：停派一个任务是要人接手的事，不能等到心跳才看得见
 - 默认**关闭**，仓库模板也不开——插件不主动往磁盘写东西
 - 写入失败一律静默：观测是便利，满盘或只读 profile 不能卡住派发
 - **熔断打开导致这一轮没派发时也会写**——那正是最该看日志的时刻，静默等于在最需要的时候失声
@@ -403,7 +408,7 @@ grep 'autopilot-start' team-autopilot.log       # 每次重启：哪个版本、
 - **尚未做**（都是官方书面声明的空档，但本插件当前未实现）：**投递确认**与**团队 token 预算闸**。注意现有的 `maxConcurrent` / `teamBudgets` 是**并发**预算，不是花钱预算。
   - 投递确认做不了，不只是「官方不保证重试」：`team/message/queued` 与 `team/message/delivered` 的 schema 仍在（历史可读），但 **Team 已不再写入这两种事件**（解包核实：包内无任何 append 点）。没有 delivered 事件就无法确认对方收到，剩下的只有「`sendMessage` 抛错后重试」——那是发送重试，不是投递确认。
 - **明确不做**（判据均为源码层）：**质量门**（验收属语义判断，与确定性定位冲突，且不在派发 tick 职责内）、**toolPolicies**（按角色限制工具需要拦截层，官方只提供 `ctx.approval` 一次性人工批准，没有暴露策略接口）、**per-member model**（Team 层 `spawn_teammate` 不转发 `agentOptions`）。
-- **回收的边界**：`avoid` 与拒绝集合都是**任务级**，不是成员级冷却——同一个成员仍可能被派到别的任务。若某成员对**所有**任务都不接，它会在每个任务上各被记录一次，那些任务最终各自停派（`declined`），要恢复得让任务易手（被认领、完成或回收）。真机上撞到的 `rev 3 → rev 20` 循环（同一任务反复派回同一成员、约 8–9 轮）已由此消除
+- **回收的边界**：`avoid` 与拒绝集合都是**任务级**，不是成员级冷却——同一个成员仍可能被派到别的任务。若某成员对**所有**任务都不接，它会在每个任务上各被记录一次，那些任务最终各自停派（`declined`），要恢复得让任务易手（被认领、完成或回收）。真机上撞到的 `rev 3 → rev 20` 循环（同一任务反复派回同一成员、约 8–9 轮）已由此消除。**回收本身也有同样的形状**：`avoid` 只挡本轮前主人，而回收会清空该任务的拒绝记录（理由是「任务换了手，旧拒绝作废」），于是原主人下一轮又合格——这正是 `reclaimRetryLimit` 存在的理由，它给这条环加了一个终点
 
 ## 官方会不会把这些做了
 

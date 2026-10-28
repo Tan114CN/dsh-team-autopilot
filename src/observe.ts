@@ -61,6 +61,10 @@ export function startupLine(at: number, config: Required<Config>): string {
     `tickMs=${config.tickTimeoutMs}`,
     `wakeMs=${config.wakeCooldownMs}`,
     `reclaimMs=${config.reclaimAfterMs}`,
+    // How many times a task may come back before it is parked. Printed with
+    // the rest of the settings because a `park=` in the log is unreadable
+    // without the limit that produced it.
+    `retryLimit=${config.reclaimRetryLimit}`,
     `heartbeatMs=${config.statusHeartbeatMs}`,
     `dryRun=${config.dryRun}`,
   ].join(' ')
@@ -97,6 +101,11 @@ export function statusLine(team: TeamState, at: number): string {
     `scope=${team.skippedScope}`,
     `noMember=${team.skippedNoMember}`,
     `declined=${team.skippedDeclined}`,
+    // Cumulative, like its siblings, and sitting next to them on purpose: the
+    // four numbers together say which fix applies, and a task that keeps
+    // coming back is the one cause a reader cannot diagnose from a single
+    // round. The *current* parked tasks are announced as an event below.
+    `parked=${team.skippedParked}`,
     // Why this round skipped anything, deduplicated. `-` rather than omitting
     // the field: "nothing was skipped" is a fact a reader needs, and an absent
     // key is indistinguishable from an older build.
@@ -132,6 +141,11 @@ export function statusLine(team: TeamState, at: number): string {
     parts.push(`reclaim=${reclaim.taskId}<${reclaim.previousOwner}`)
     parts.push(reclaim.applied ? 'reclaimed' : 'reclaim-dry-run')
   }
+  const park = team.lastPark
+  if (park !== undefined && team.parked.has(park.taskId)) {
+    parts.push(`park=${park.taskId}<${park.previousOwner}`)
+    parts.push(`after=${park.reclaims}`)
+  }
   return parts.join(' ')
 }
 
@@ -156,7 +170,7 @@ export function statusSignature(line: string): string {
     // quiet log — one whose work is stuck — and quietly turn the heartbeat
     // back into a per-tick write. The totals stay in the line for whoever
     // reads it; they just do not make a round newsworthy on their own.
-    .replace(/\s(?:skip|scope|noMember|declined)=\d+/g, '')
+    .replace(/\s(?:skip|scope|noMember|declined|parked)=\d+/g, '')
 }
 
 /**

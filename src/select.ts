@@ -52,6 +52,15 @@ export interface PlanInput {
    *    while an idle colleague waits for a turn.
    */
   readonly avoid?: ReadonlyMap<string, ReadonlySet<string>>
+  /**
+   * Parked tasks, mapped to the number of reclaims that parked them.
+   *
+   * Refused before every other cause: a parked task is held back however much
+   * room and however many idle members there are, so reporting it as a scope
+   * collision or a member shortage would point the reader at a fix that cannot
+   * help. The count travels with the id because it is the whole reason.
+   */
+  readonly parked?: ReadonlyMap<string, number>
 }
 
 /** One autopilot decision round. */
@@ -321,6 +330,19 @@ export function planDispatch(input: PlanInput): PlanResult {
 
   for (const task of claimableTasks(tasks)) {
     if (plans.length >= slots) break
+
+    const reclamations = input.parked?.get(task.id)
+    if (reclamations !== undefined) {
+      // Waking a member for this again would reproduce the loop that parked
+      // it: claim, go quiet, get reclaimed, get woken. The count is part of the
+      // reason because "parked" alone does not say how it got there.
+      blocked.push({
+        taskId: task.id,
+        kind: 'parked',
+        reason: `parked after ${reclamations} reclaims without progress`,
+      })
+      continue
+    }
 
     const conflict = findScopeConflict(task, tasks)
       ?? plannedScopes.find(entry =>

@@ -14,7 +14,7 @@
  */
 
 import type { BreakerState } from './breaker.ts'
-import type { DispatchRecord, ReclaimRecord, SkipKind, TeamState } from './state.ts'
+import type { DispatchRecord, ParkRecord, ReclaimRecord, SkipKind, TeamState } from './state.ts'
 
 /** One team's counters and the board as of its last observation. */
 export interface TeamReport {
@@ -34,6 +34,8 @@ export interface TeamReport {
   skippedNoMember: number
   /** Skips caused by every idle teammate having already declined the task. */
   skippedDeclined: number
+  /** Skips caused by the task being parked after repeated reclaims. */
+  skippedParked: number
   /**
    * Why the team's *last* round skipped tasks, deduplicated and sorted.
    *
@@ -57,6 +59,14 @@ export interface TeamReport {
   breakerBlocked: number
   /** Tasks handed back to the pool after their owner stalled. */
   reclaimed: number
+  /**
+   * Tasks the autopilot has stopped offering, with the history that parked them.
+   *
+   * Reported as the records rather than a count: a bare "1 parked" leaves the
+   * reader with no way to find the task, and the whole point of parking is that
+   * a human now has to decide something about it.
+   */
+  parked: ParkRecord[]
   /** Board size at the team's last observation. */
   tasks: number
   /** Slots occupied at the team's last observation. */
@@ -120,6 +130,7 @@ export function toTeamReport(team: TeamState): TeamReport {
     skippedScope: team.skippedScope,
     skippedNoMember: team.skippedNoMember,
     skippedDeclined: team.skippedDeclined,
+    skippedParked: team.skippedParked,
     why: [...team.skipKinds],
     unclaimed: team.unclaimed,
     pending: team.pendingWakes.size,
@@ -127,6 +138,7 @@ export function toTeamReport(team: TeamState): TeamReport {
     breakerTrips: team.breakerTrips,
     breakerBlocked: team.breakerBlocked,
     reclaimed: team.reclaimed,
+    parked: [...team.parked.values()],
     tasks: team.tasks,
     inFlight: team.inFlight,
     claimable: team.claimable,
@@ -166,6 +178,8 @@ export interface StatusReport {
   unclaimed: number
   /** Lifetime tasks handed back to the pool across every team. */
   reclaimed: number
+  /** Tasks currently parked across every team. */
+  parked: number
   /** One entry per live team. */
   teams: TeamReport[]
   /** The caller's own team, read live. Absent when the caller is not in a team. */
@@ -186,7 +200,7 @@ export interface StatusReport {
 export function renderReport(report: StatusReport, now: number): string[] {
   const lines: string[] = []
   lines.push(`autopilot ${report.enabled && !report.dryRun ? 'active' : 'inactive'}`)
-  lines.push(`totals rounds=${report.rounds} dispatched=${report.dispatched} suppressed=${report.suppressed} skipped=${report.skipped} unclaimed=${report.unclaimed} reclaimed=${report.reclaimed}`)
+  lines.push(`totals rounds=${report.rounds} dispatched=${report.dispatched} suppressed=${report.suppressed} skipped=${report.skipped} unclaimed=${report.unclaimed} reclaimed=${report.reclaimed} parked=${report.parked}`)
   if (report.caller !== undefined) {
     const live = report.caller
     lines.push(`caller team=${live.team} tasks=${live.tasks} inFlight=${live.inFlight} claimable=${live.claimable} blocked=${live.blocked} done=${live.done} idle=${live.idle} slots=${live.slots} (live)`)
@@ -196,7 +210,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
     const age = team.lastTickAt === undefined ? 'never' : `${Math.max(0, now - team.lastTickAt)}ms ago`
     lines.push(
       `  team=${team.team} ticks=${team.ticks} dispatched=${team.dispatched} suppressed=${team.suppressed}`
-      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined})`
+      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined} parked=${team.skippedParked})`
       // Same word, same `-` for "nothing", so a reader who learned the log line
       // can read this one: the counters are lifetime, `why` is the last round.
       + ` why=${team.why.length === 0 ? '-' : team.why.join(',')}`
@@ -241,6 +255,18 @@ export function renderReport(report: StatusReport, now: number): string[] {
       lines.push(
         `    warning: ${team.unclaimed} wakes went unclaimed — a member that never claims`
         + ' holds the dispatch channel while its task stays in the pool',
+      )
+    }
+    // Parked tasks, one line each. The autopilot has deliberately stopped
+    // offering these: every reclaim looked legitimate on its own, and only the
+    // count shows that the same work keeps coming back. Whoever reads this is
+    // now the one who can end it — claim the task, split it, or fix the reason
+    // the members stall on it.
+    for (const record of team.parked) {
+      lines.push(
+        `    parked task=${record.taskId} after=${record.reclaims} reclaims`
+        + ` lastOwner=${record.previousOwner} (${Math.max(0, now - record.at)}ms ago)`
+        + ' — no further wake until it is claimed or the plugin restarts',
       )
     }
     // Every idle member has already had this task and passed. Dispatch has

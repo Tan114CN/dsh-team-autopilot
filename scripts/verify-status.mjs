@@ -164,6 +164,7 @@ const warm = {
     skippedScope: 0,
     skippedNoMember: 0,
     skippedDeclined: 0,
+    skippedParked: 0,
     why: ['scope'],
     unclaimed: 1,
     pending: 1,
@@ -171,6 +172,9 @@ const warm = {
     breakerTrips: 0,
     breakerBlocked: 0,
     reclaimed: 1,
+    parked: [
+      { taskId: 'task-4', reclaims: 3, previousOwner: 'worker-x', at: 2_700 },
+    ],
     tasks: 1,
     inFlight: 1,
     claimable: 0,
@@ -204,6 +208,9 @@ assert.match(warmText, /lastDispatch task=task-1 to=worker-x wakes=2 sent outcom
 // `why` is the one status field declared as an array. Assert it is enforced as
 // one: a string would pass a check that only looked at presence.
 assert.match(warmText, /why=scope /)
+// Parked tasks are an array of nested objects — the shape most likely to be
+// declared, never exercised, and then rejected by the host's compiler.
+assert.match(warmText, /parked task=task-4 after=3 reclaims lastOwner=worker-x \(\d+ms ago\)/)
 const stringWhy = {
   ...warm,
   teams: [{ ...warm.teams[0], why: 'scope' }],

@@ -248,6 +248,22 @@ test('planDispatch reports a task nobody is left to take as declined', () => {
   assert.match(result.blocked[0]?.reason ?? '', /alice/)
 })
 
+test('planDispatch refuses a parked task however much room there is', () => {
+  // Parking is not a shortage: the member, the slot and the scopes are all
+  // available, and the task is still withheld. Reporting this as `noMember`
+  // would send the reader to add a member that changes nothing.
+  const result = planDispatch({
+    tasks: [task({ id: 't1' }), task({ id: 't2' })],
+    members: [member('alice', 'inactive'), member('bob', 'inactive')],
+    maxConcurrent: 4,
+    parked: new Map([['t1', 3]]),
+  })
+  assert.deepEqual(result.plans.map(plan => plan.taskId), ['t2'])
+  const blocked = result.blocked.find(entry => entry.taskId === 't1')
+  assert.equal(blocked?.kind, 'parked')
+  assert.match(blocked?.reason ?? '', /3 reclaims/)
+})
+
 test('wakeMessage tells the member to claim with the revision', () => {
   const plan: DispatchPlan = {
     taskId: 't1',
@@ -514,12 +530,15 @@ test('startupLine names the build and the settings it is running with', () => {
     halfOpenProbe: 1,
     reclaimAfterMs: 300_000,
     reclaimOnFailed: true,
+    reclaimRetryLimit: 3,
     statusFile: 'C:/tmp/status.log',
     statusHeartbeatMs: 600_000,
   }
   const line = startupLine(0, config)
   assert.match(line, /^1970-01-01T00:00:00\.000Z autopilot-start /)
-  assert.match(line, /tickMs=30000 wakeMs=60000 reclaimMs=300000 heartbeatMs=600000 dryRun=false$/)
+  // The reclaim limit belongs here: a `park=` in the log cannot be read
+  // without the limit that produced it, and a restart is when it changes.
+  assert.match(line, /reclaimMs=300000 retryLimit=3 heartbeatMs=600000 dryRun=false$/)
   // A restart is only diagnosable if the line says which build came back.
   assert.match(line, /version=\d+\.\d+\.\d+ /)
 })
@@ -534,6 +553,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
     skipped: 0,
     unclaimed: 0,
     reclaimed: 0,
+    parked: 0,
     teams: [
       {
         team: 'team-a',
@@ -544,6 +564,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         skippedScope: 0,
         skippedNoMember: 0,
         skippedDeclined: 0,
+        skippedParked: 0,
         why: [],
         unclaimed: 0,
         pending: 0,
@@ -551,6 +572,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         breakerTrips: 0,
         breakerBlocked: 0,
         reclaimed: 0,
+        parked: [],
         tasks: 1,
         inFlight: 1,
         claimable: 0,
@@ -600,6 +622,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
     skipped: 1,
     unclaimed: 2,
     reclaimed: 2,
+    parked: 1,
     teams: [
       {
         team: 'team-a',
@@ -610,6 +633,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         skippedScope: 1,
         skippedNoMember: 0,
         skippedDeclined: 0,
+        skippedParked: 0,
         why: ['scope'],
         unclaimed: 2,
         pending: 1,
@@ -617,6 +641,9 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         breakerTrips: 0,
         breakerBlocked: 0,
         reclaimed: 2,
+        parked: [
+          { taskId: 'task-4', reclaims: 3, previousOwner: 'worker-b', at: 2_900 },
+        ],
         tasks: 3,
         inFlight: 0,
         claimable: 1,
@@ -644,8 +671,8 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
     ],
   }
   const text = renderReport(report, 3_000).join('\n')
-  // The skip total is broken down, so the two opposite fixes are told apart.
-  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0\)/)
+  // The skip total is broken down, so the four fixes are told apart.
+  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0 parked=0\)/)
   // The breakdown says where the total came from; `why` says what the last
   // round ran into. Both, because they answer different questions.
   assert.match(text, /why=scope /)
@@ -655,6 +682,9 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   assert.match(text, /lastDispatch task=task-3 to=worker-a wakes=3 sent outcome=unclaimed \(200ms ago\)/)
   // The loop signature is called out instead of left for the reader to infer.
   assert.match(text, /warning: 2 wakes went unclaimed/)
+  // A parked task is spelled out rather than counted: the reader has to be
+  // able to find the task and decide, and "1 parked" would not even name it.
+  assert.match(text, /parked task=task-4 after=3 reclaims lastOwner=worker-b \(100ms ago\)/)
 })
 
 test('reclaims a task whose owner left the roster', () => {
@@ -776,8 +806,9 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   assert.match(idle, /skip=2 scope=1 noMember=0 declined=1 /)
   assert.match(idle, /unclaimed=1 pending=0 reclaimed=0 tasks=2 inFlight=0 claimable=1 blocked=1 done=0 idle=2 slots=2 /)
   // "Nothing was skipped" is printed as `-` rather than omitted: an absent key
-  // reads as an older build, not as good news.
-  assert.match(idle, /declined=1 why=- unclaimed=1 /)
+  // reads as an older build, not as good news. The four skip counters sit in
+  // one block so the cause is readable without the status tool.
+  assert.match(idle, /declined=1 parked=0 why=- unclaimed=1 /)
   assert.match(idle, /breaker=closed trips=0 held=0$/)
   assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
 
@@ -820,6 +851,32 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
     statusSignature(blockedByScope),
     'a new reason is a change',
   )
+
+  // Parking is an event, so it belongs in the signature: a task the autopilot
+  // just gave up on is exactly the news an operator must not have to wait for
+  // the heartbeat to read. The cumulative count is still just a counter.
+  const beforePark = statusLine(team, 0)
+  team.skippedParked = 4
+  assert.equal(
+    statusSignature(statusLine(team, 0)),
+    statusSignature(beforePark),
+    'a climbing park counter is not a change',
+  )
+  const park = { taskId: 't2', reclaims: 3, previousOwner: 'bob', at: 0 }
+  team.parked.set('t2', park)
+  team.lastPark = park
+  const parkedLine = statusLine(team, 0)
+  assert.match(parkedLine, /parked=4 /, 'the cumulative park skips sit with their siblings')
+  assert.match(parkedLine, /park=t2<bob after=3$/)
+  assert.notEqual(
+    statusSignature(parkedLine),
+    statusSignature(beforePark),
+    'a new park is a change',
+  )
+  // The announcement is about a *live* park: once the task is unparked the
+  // event line stops claiming it, instead of outliving the condition.
+  team.parked.clear()
+  assert.equal(statusLine(team, 0).includes('park='), false, 'an unparked task is not announced')
 })
 
 if (failures.length > 0) {

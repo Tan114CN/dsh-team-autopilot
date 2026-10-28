@@ -12,7 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import type { Config } from './index.ts'
 import { findLeads } from './lead.ts'
-import { boardSummary, claimableTasks, planDispatch, wakeMessage } from './select.ts'
+import { boardSummary, claimableTasks, isInFlight, planDispatch, wakeMessage } from './select.ts'
 import type { DispatchPlan } from './select.ts'
 import { planReclaim } from './reclaim.ts'
 import {
@@ -24,7 +24,7 @@ import {
 } from './breaker.ts'
 import type { Breaker, BreakerConfig, BreakerState } from './breaker.ts'
 import { createAutopilotState, teamState } from './state.ts'
-import type { AutopilotState, TeamState } from './state.ts'
+import type { AutopilotState, ParkRecord, TeamState } from './state.ts'
 import { appendStatusLine, startupLine, statusLine, statusSignature } from './observe.ts'
 
 /**
@@ -282,6 +282,13 @@ export async function tick(
   for (const [taskId, at] of reclaim.stalled) stalled.set(taskId, at)
 
   let released = 0
+  // Which reclaims actually count towards a park. A `reassign` that failed on a
+  // stale revision released nothing, so the task did not come back — counting
+  // it would park a task for the autopilot's own write failures. `dryRun`
+  // counts, though: there the decision is the whole point, and the host is
+  // running dry-run by default, so excluding it would make the park invisible
+  // exactly where it most needs to be seen.
+  const releasedTargets: Array<{ taskId: string; previousOwner: string }> = []
   for (const target of reclaim.releases) {
     let applied = false
     if (!config.dryRun) {
@@ -301,6 +308,7 @@ export async function tick(
       }
     }
     released += 1
+    releasedTargets.push({ taskId: String(target.taskId), previousOwner: target.previousOwner })
     // Recorded even under dryRun, where `applied` stays false: the point of
     // the record is to show what the autopilot decided and about which task.
     team.lastReclaim = {
@@ -315,6 +323,61 @@ export async function tick(
     team.reclaimed += released
     tasks = ctx.agentTeams.listTasks(lead)
     members = ctx.agentTeams.listMembers(lead)
+  }
+
+  // Reclaim bookkeeping. Releasing a stalled owner is right; doing it forever
+  // is not. The task goes back to the pool, the next member claims it and goes
+  // just as quiet, and the lap repeats at one model turn each — on a real host
+  // that was twelve reclaims in twenty minutes with nothing finished. Counting
+  // is what tells the two apart: one reclaim is a stalled owner, the same task
+  // back several times is work no member can finish, and no further wake will
+  // change that. So past the limit the autopilot stops offering it and says so.
+  for (const released of releasedTargets) {
+    const taskId = released.taskId
+    const count = (team.reclaimCounts.get(taskId) ?? 0) + 1
+    team.reclaimCounts.set(taskId, count)
+    if (config.reclaimRetryLimit === 0 || count < config.reclaimRetryLimit) continue
+    if (team.parked.has(taskId)) continue
+    const record: ParkRecord = {
+      taskId,
+      reclaims: count,
+      previousOwner: released.previousOwner,
+      at: Date.now(),
+    }
+    team.parked.set(taskId, record)
+    // Kept as the announcement, the same way `lastReclaim` is: the next
+    // dispatch is the one that will not happen, and this is why.
+    team.lastPark = record
+  }
+
+  // A park describes one stand-off, so it is dropped the moment that stand-off
+  // ends: the task finished, left the board, or somebody *other than the member
+  // it was taken from* took it up again. The last clause is what keeps a
+  // `dryRun` host honest — there the board never changes, so the task still
+  // shows the same owner and the park must survive to be reported.
+  //
+  // `reclaimCounts` follows the same rule, which is also how both maps stay
+  // bounded by the tasks actually in play rather than by every id ever seen.
+  const board = new Map(tasks.map(entry => [String(entry.id), entry]))
+  const forget = (taskId: string): void => {
+    team.parked.delete(taskId)
+    team.reclaimCounts.delete(taskId)
+  }
+  const parked = new Map<string, number>()
+  for (const [taskId, record] of [...team.parked]) {
+    const current = board.get(taskId)
+    const over = current === undefined
+      || current.status === 'completed'
+      || current.status === 'deleted'
+      || (isInFlight(current) && String(current.ownerName) !== record.previousOwner)
+    if (over) {
+      forget(taskId)
+      continue
+    }
+    parked.set(taskId, record.reclaims)
+  }
+  for (const taskId of [...team.reclaimCounts.keys()]) {
+    if (!board.has(taskId)) forget(taskId)
   }
   // Two different situations both mean "this member already had its turn on
   // this task", so they travel down one channel:
@@ -357,6 +420,7 @@ export async function tick(
     members,
     maxConcurrent: budget,
     avoid,
+    parked,
   })
   const summary = boardSummary(tasks, members, budget)
 
@@ -372,12 +436,14 @@ export async function tick(
   team.slots = summary.slots
   // Cumulative, like every other counter here: "how many skip decisions has
   // this team produced" is the number worth watching, and the split says
-  // which of the two opposite fixes applies — widen the scopes, or add a
-  // member. One task blocked for five rounds counts five times, on purpose.
+  // which fix applies — widen the scopes, add a member, ask the members why
+  // they stopped taking work, or deal with a task that keeps coming back. One
+  // task blocked for five rounds counts five times, on purpose.
   team.skipped += blocked.length
   for (const entry of blocked) {
     if (entry.kind === 'scope') team.skippedScope += 1
     else if (entry.kind === 'declined') team.skippedDeclined += 1
+    else if (entry.kind === 'parked') team.skippedParked += 1
     else team.skippedNoMember += 1
   }
   // The counters above are cumulative, so they are kept out of the status

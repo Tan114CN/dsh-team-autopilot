@@ -65,13 +65,15 @@ interface Host {
   failSend: boolean
   /** Every updateTask call, in order. */
   updates: Array<{ taskId: string; action: string }>
+  /** Make every `updateTask` throw, to stand in for a stale revision. */
+  failUpdate: boolean
 }
 
 function makeHost(
   tasks: TeamTaskView[],
   members: TeamMemberView[],
 ): Host {
-  return { tasks, members, sent: [], attempts: 0, failSend: false, updates: [] }
+  return { tasks, members, sent: [], attempts: 0, failSend: false, updates: [], failUpdate: false }
 }
 
 function makeCtx(host: Host): Context {
@@ -93,6 +95,7 @@ function makeCtx(host: Host): Context {
         _caller: object,
         request: { taskId: string; action: string },
       ): Promise<void> => {
+        if (host.failUpdate) throw new Error('simulated revision conflict')
         host.updates.push({ taskId: request.taskId, action: request.action })
         if (request.action !== 'reassign') return
         const target = host.tasks.find(entry => entry.id === request.taskId)
@@ -136,6 +139,7 @@ const baseConfig: Required<Config> = {
   halfOpenProbe: 1,
   reclaimAfterMs: 300_000,
   reclaimOnFailed: true,
+  reclaimRetryLimit: 3,
   statusFile: '',
   statusHeartbeatMs: 600_000,
 }
@@ -345,6 +349,81 @@ await test('records the last reclaim as dry-run when it was not applied', async 
   assert.deepEqual(host.updates, [], 'dryRun must not touch the board')
   assert.equal(teamOf(state).reclaimed, 1, 'the decision is still counted')
   assert.equal(teamOf(state).lastReclaim?.applied, false, 'but it is marked as not applied')
+})
+
+await test('parks a task that keeps coming back instead of waking forever', async () => {
+  // The real-host loop this is about: the task is claimed, the owner goes
+  // quiet, the autopilot reclaims it, the next member claims it and goes quiet
+  // the same way. Every lap is a legitimate-looking reclaim and a model turn.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, maxConcurrent: 1, reclaimRetryLimit: 3 }
+  const ctx = makeCtx(host)
+  const wake = new Map<string, number>()
+  const stale = (): Map<string, number> => new Map([['t1', Date.now() - 600_000]])
+
+  // Round 1: alice's task is reclaimed and handed to bob.
+  await tick(ctx, lead, config, state, 'team-1', wake, stale(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['bob'], 'the freed task goes to the other member')
+  // Bob claims it, then stalls exactly like alice did.
+  host.tasks[0] = task({ id: 't1', status: 'in_progress', ownerName: 'bob' })
+
+  // Round 2: bob's task is reclaimed and handed back to alice.
+  await tick(ctx, lead, config, state, 'team-1', wake, stale(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['bob', 'alice'])
+  host.tasks[0] = task({ id: 't1', status: 'in_progress', ownerName: 'alice' })
+
+  // Round 3: the limit is reached — reclaimed once more, but nobody is woken.
+  await tick(ctx, lead, config, state, 'team-1', wake, stale(), createBreaker(), signal)
+  const team = teamOf(state)
+  assert.equal(team.reclaimed, 3, 'the owner is still released: someone else may still finish it')
+  assert.deepEqual(host.sent, ['bob', 'alice'], 'past the limit no wake is sent')
+  assert.equal(team.parked.get('t1')?.reclaims, 3)
+  assert.equal(team.lastPark?.previousOwner, 'alice')
+  assert.equal(team.skippedParked, 1)
+  assert.deepEqual(team.skipKinds, ['parked'])
+  // Parking is an autopilot decision, never a board edit: the task stays
+  // claimable so the Lead or a human can still pick it up.
+  assert.equal(team.claimable, 1)
+
+  // Round 4: still parked, still silent.
+  await tick(ctx, lead, config, state, 'team-1', wake, new Map(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['bob', 'alice'])
+  assert.equal(team.skippedParked, 2)
+
+  // Somebody else takes it up — the stand-off this park describes is over.
+  host.tasks[0] = task({ id: 't1', status: 'in_progress', ownerName: 'bob' })
+  await tick(ctx, lead, config, state, 'team-1', wake, new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).parked.size, 0, 'a task that moved on is offered again')
+  assert.equal(teamOf(state).reclaimCounts.has('t1'), false)
+})
+
+await test('a reclaim that failed to write does not count towards parking', async () => {
+  // The park is about the task coming back, and a `reassign` rejected on a
+  // stale revision never brought it back — that failure belongs to the
+  // autopilot's own write path, not to the work. Counting it would stop
+  // offering a perfectly viable task because we could not reach the board.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  host.failUpdate = true
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, maxConcurrent: 1, reclaimRetryLimit: 1 }
+  const stale = (): Map<string, number> => new Map([['t1', Date.now() - 600_000]])
+
+  for (let round = 0; round < 3; round += 1) {
+    await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), stale(), createBreaker(), signal)
+  }
+
+  const team = teamOf(state)
+  assert.equal(team.reclaimed, 0, 'a failed release is not a release')
+  assert.equal(team.parked.size, 0, 'and it must not park the task')
+  assert.equal(team.reclaimCounts.get('t1'), undefined, 'nothing was handed back, so nothing is owed')
+  assert.match(state.lastError ?? '', /revision conflict/, 'the failure is still visible')
 })
 
 await test('counts a wake that nobody claimed', async () => {
@@ -709,7 +788,7 @@ await test('writes a boot marker before the first round', async () => {
   // A restart is otherwise only visible as `ticks=1`, which says nothing about
   // which build came back or which settings it is running with.
   assert.match(lines[0] ?? '', /autopilot-start version=\d+\.\d+\.\d+ /)
-  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 heartbeatMs=600000 dryRun=false$/)
+  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 retryLimit=3 heartbeatMs=600000 dryRun=false$/)
 })
 
 if (failures.length > 0) {

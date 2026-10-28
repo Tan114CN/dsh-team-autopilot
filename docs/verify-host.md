@@ -55,17 +55,17 @@ bundle 的组合只在 App 启动时进行，**关窗口 ≠ 退出**。
 
 ```
 autopilot inactive
-totals rounds=0 dispatched=0 suppressed=0 skipped=0 unclaimed=0 reclaimed=0
+totals rounds=0 dispatched=0 suppressed=0 skipped=0 unclaimed=0 reclaimed=0 parked=0
 caller team=session-… tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (live)
 teams=1
-  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 pending=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
+  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0 parked=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 pending=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
     lastReclaim none
     lastDispatch none
 ```
 
 - `inactive` 是因为 `dryRun: true`（`enabled` 仍为 `true`），**但计数会随轮次增长**，这是正常的。
 - `caller` 一行是**调用方自己团队**的实时板（live），`team=` 那行是 autopilot 上次 tick 的快照并带年龄——两者数值不一致是正常的。
-- `skipped` 后面的 `(scope / noMember / declined)` 是跳过原因拆分：写域冲突 / 没有空闲成员 / 空闲成员全都拒绝过这个任务。
+- `skipped` 后面的 `(scope / noMember / declined / parked)` 是跳过原因拆分：写域冲突 / 没有空闲成员 / 空闲成员全都拒绝过这个任务 / **回收太多次已被停派**。前三个是「这一轮为什么没派」，第四个是「这个任务已经不派了」——要看具体是哪几个任务，用 status 工具，它把 `parked` 逐条列出（`task` / `after` / `lastOwner`）。
 - `tasks` 是**四分桶，恒等于总数**：`inFlight + claimable + blocked + done == tasks`。`blocked` 是卡在依赖上的（`pending` 未 `ready` 且无 owner），`done` 是 `completed`/`deleted`。所以「4 个任务、0 可派、2 个空闲」能立刻区分出是卡依赖还是活已干完。
 - `lastReclaim none` / `lastDispatch none` 是**「还没发生过」**，不是字段缺失。空行与「这版不会报这个字段」在读的人眼里一样，所以显式打 `none`。
 - 若模型说"没有这个工具" → 插件未加载，跳到 2.4。
@@ -77,8 +77,9 @@ teams=1
 - 每次**进程启动**写一行 `autopilot-start`，带版本号和生效配置
 - 团队的**字段有变化**时立即写
 - **没有变化**时只在 `statusHeartbeatMs`（默认 10 分钟）到期时写一行心跳
-- **累计跳过计数不算变化**：`skip` / `scope` / `noMember` / `declined` 是累计值，任务一直没人接时它们每轮都在涨，若算作变化就等于逐轮写。`< 0.3.4` 正是栽在这里——只要团队里有被拒过一次的任务，日志就会退化回每 tick 一行
+- **累计跳过计数不算变化**：`skip` / `scope` / `noMember` / `declined` / `parked` 是累计值，任务一直没人接时它们每轮都在涨，若算作变化就等于逐轮写。`< 0.3.4` 正是栽在这里——只要团队里有被拒过一次的任务，日志就会退化回每 tick 一行
 - **但本轮原因 `why` 算**：计数不进比较，原因进。从 `why=-` 变成 `why=scope`，或变成 `why=declined`（全员拒接、插件就此停手），都会立即写一行，不必等心跳——这是「安静」和「瞎」的分界
+- **`park=` 事件也算**：停派一个任务是要人接手的事，不能等到心跳才看得见。它由 `park=<任务><上个 owner> after=N` 这一段表达，而这段不进签名比较（`after=` 恒定时不变），所以只会在**刚停派**或**停派集合变化**时出现，不是每轮一行
 
 所以「文件里 10 分钟没有新行」是**按设计在工作**，不代表插件停了。要区分「安静」和「死了」，看有没有下一条心跳：
 
@@ -92,21 +93,22 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 一行长这样（字段与 status 工具同源，顺序固定）：
 
 ```
-2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 why=- unclaimed=0 pending=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
+2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 parked=0 why=- unclaimed=0 pending=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
 ```
 
 读法：
 
 | 想知道 | 看哪里 |
 |---|---|
-| 当前版本、配置有没有生效 | `grep autopilot-start`，`version=` / `tickMs=` / `heartbeatMs=` |
+| 当前版本、配置有没有生效 | `grep autopilot-start`，`version=` / `tickMs=` / `reclaimMs=` / `retryLimit=` / `heartbeatMs=` |
 | 是不是刚重启过 | 出现新的 `autopilot-start`；团队行 `ticks=1`（内存态归零） |
 | 有效节拍对不对 | 两次心跳的 `ticks` 差 ÷ 秒数 ≈ `tickMs`。安静 10 分钟应新增约 20 个 tick（只多不少：真实变化会提前唤醒），**翻倍说明在跑 `<0.3.1`** |
 | 有没有派发 | `dispatched=`；配合 `unclaimed=` / `reclaimed=` |
-| 为什么没派 | `why=` 指出本轮原因（`scope` / `noMember` / `declined` / `-`），再用 `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 定位到具体任务 |
+| 为什么没派 | `why=` 指出本轮原因（`scope` / `noMember` / `declined` / `parked` / `-`），再用 `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 定位到具体任务 |
 | 有几条唤醒还在等判定 | `pending=`。`outcome=unchecked` 只反映**最后一条**唤醒，一轮派两个任务时另一个只能靠 `pending` 看出来 |
-| 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过 |
-| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2`；status 的团队对象里没有 `why` → 低于 `0.3.6` |
+| 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过；`why=parked` → 有任务被回收太多次，已停止派发（同一行会带 `park=<任务><上个 owner> after=N`） |
+| 回收是不是在空转 | `reclaimed=` 一直涨而 `done=` 不动 → 任务被反复回收重派。`< 0.3.7` 没有终点（真机实测 20 分钟回收 12 次、派发 19 次、`done=0`）；现在达到 `retryLimit=`（默认 3）会停派，日志出现 `park=` |
+| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2`；status 的团队对象里没有 `why` → 低于 `0.3.6`；团队行没有 `parked=`、启动行没有 `retryLimit=` → 低于 `0.3.7` |
 
 > 写入失败一律静默——观测是便利，满盘或只读 profile 不能卡住派发。所以文件不存在或某段没写，不能反推成「插件没跑」，要用 2.1 的状态工具交叉确认。
 
@@ -227,7 +229,7 @@ node ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.cjs \
 | `ticks` | 该团队被 tick 的次数。**每团队每 interval 只涨 1**；涨得比「秒数 ÷ `tickMs`」快 = 版本低于 `0.3.1` |
 | `dispatched` | 成功派发次数（dryRun 下也会计数） |
 | `suppressed` | 被冷却窗口抑制的次数 |
-| `skipped` | 被跳过的任务数（累计），括号里拆成 `scope`（写域冲突）/ `noMember`（无空闲成员）/ `declined`（空闲成员全都拒绝过这个任务） |
+| `skipped` | 被跳过的任务数（累计），括号里拆成 `scope`（写域冲突）/ `noMember`（无空闲成员）/ `declined`（空闲成员全都拒绝过这个任务）/ `parked`（回收次数达到 `reclaimRetryLimit`，已停派） |
 | `unclaimed` | 唤醒后**过了冷却窗口**仍无主的次数；持续上涨 = 有成员从不接活。刚唤醒的几秒内不会判定，这是刻意的 |
 | `pending` | **已发出、还没到判定时刻**的唤醒条数。`outcome` 只反映最近一条唤醒，一轮唤醒两个任务时，另一个只能从这里看出来 |
 | `tasks` | 任务总数，**恒等于** `inFlight + claimable + blocked + done` |
@@ -242,4 +244,5 @@ node ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.cjs \
 | `breakerTrips` | 熔断打开次数 |
 | `breakerBlocked` | 因熔断而跳过的轮/任务数 |
 | `lastError` | 最近一次错误文本 |
-| `why` | 本轮跳过原因的集合（`scope` / `noMember` / `declined`，无跳过时 `-`），去重排序。日志行与 status 同词；status 里是**数组**（`["declined","scope"]`，空数组等于 `-`）。前面那些 `skipped*` 是累计值，只有 `why` 回答「此刻为什么不动」；它只在原因变化时才变，所以「全员拒接、插件停手」会立刻落一行而不用等心跳 |
+| `parked` | `parked=<N>`：当前被停派的任务**条目数**（不是累计次数），status 里逐条列出 `task` / `after`（第几次回收时停的）/ `lastOwner`。只停派发、不动任务板：任务仍是 `claimable`，被人或 Lead 接手、完成、或从板上消失后记录即清除；**重启插件也会清空**——这是目前唯一的人工放行路径 |
+| `why` | 本轮跳过原因的集合（`scope` / `noMember` / `declined` / `parked`，无跳过时 `-`），去重排序。日志行与 status 同词；status 里是**数组**（`["declined","scope"]`，空数组等于 `-`）。前面那些 `skipped*` 是累计值，只有 `why` 回答「此刻为什么不动」；它只在原因变化时才变，所以「全员拒接、插件停手」会立刻落一行而不用等心跳 |

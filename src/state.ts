@@ -85,13 +85,34 @@ export interface DispatchRecord {
 }
 
 /**
+ * A task the autopilot stopped handing out.
+ *
+ * Reclaiming a stalled owner is right, but doing it forever is not: the task
+ * goes back to the pool, the next member claims it and stalls just as quietly,
+ * and the cycle repeats at one model turn per lap. A task that has come back
+ * this many times is not waiting for a slot — it is evidence that no member can
+ * finish it, and the fix is a human decision, not another wake.
+ */
+export interface ParkRecord {
+  /** Id of the parked task. */
+  taskId: string
+  /** How many times the task was reclaimed before it was parked. */
+  reclaims: number
+  /** Member the task was last taken from. */
+  previousOwner: string
+  /** Epoch milliseconds the task was parked. */
+  at: number
+}
+
+/**
  * Why a ready task went untaken in one round.
  *
- * Three causes, three opposite fixes: widen the write scopes, add a member, or
- * ask the member why it is not taking work. A closed union on purpose — a typo
- * must not be able to invent a fourth cause that nobody knows how to act on.
+ * Four causes, four different fixes: widen the write scopes, add a member, ask
+ * the member why it is not taking work, or look at a task that keeps coming
+ * back. A closed union on purpose — a typo must not be able to invent a fifth
+ * cause that nobody knows how to act on.
  */
-export type SkipKind = 'scope' | 'noMember' | 'declined'
+export type SkipKind = 'scope' | 'noMember' | 'declined' | 'parked'
 
 /** One team's observable counters and the board as of its last tick. */
 export interface TeamState {
@@ -111,6 +132,8 @@ export interface TeamState {
   skippedNoMember: number
   /** Skips caused by every idle teammate having already declined the task. */
   skippedDeclined: number
+  /** Skips caused by the task being parked after repeated reclaims. */
+  skippedParked: number
   /**
    * Why the **last** round skipped ready tasks, deduplicated and sorted.
    *
@@ -153,6 +176,26 @@ export interface TeamState {
   breakerBlocked: number
   /** Tasks handed back to the pool after their owner stalled. */
   reclaimed: number
+  /**
+   * Reclaims per task id, carried across rounds.
+   *
+   * This is the number that tells a genuine one-off stall apart from a task no
+   * member can finish: the first is released once and completes, the second
+   * comes back every cooldown. Cleared when the task finishes, leaves the
+   * board, or is taken up again by somebody — a task that moved on no longer
+   * needs its history held against it.
+   */
+  reclaimCounts: Map<string, number>
+  /**
+   * Tasks the autopilot no longer hands out, keyed by task id.
+   *
+   * A parked task stays visible on the board and stays claimable by a human or
+   * the Lead — the autopilot only stops waking members for it. Nothing else
+   * would end the loop: every lap looks like a fresh, legitimate stall.
+   */
+  parked: Map<string, ParkRecord>
+  /** This team's most recent park, if any. */
+  lastPark?: ParkRecord
   /** Board size at the team's last tick. */
   tasks: number
   /** Slots occupied at the team's last tick. */
@@ -242,6 +285,7 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     skippedScope: 0,
     skippedNoMember: 0,
     skippedDeclined: 0,
+    skippedParked: 0,
     skipKinds: [],
     declined: new Map(),
     unclaimed: 0,
@@ -249,6 +293,8 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     breakerTrips: 0,
     breakerBlocked: 0,
     reclaimed: 0,
+    reclaimCounts: new Map(),
+    parked: new Map(),
     tasks: 0,
     inFlight: 0,
     claimable: 0,

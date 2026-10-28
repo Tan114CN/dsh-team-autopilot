@@ -56,6 +56,15 @@ export interface Config {
   /** Whether a `failed` owner hands its task back to the pool at once. */
   readonly reclaimOnFailed?: boolean
   /**
+   * How many times one task may be reclaimed before the autopilot parks it.
+   *
+   * `0` restores the old behaviour of reclaiming forever. The limit exists
+   * because reclaiming a stalled owner is right but repeating it is not: each
+   * lap costs a model turn, and a task that comes back this often is evidence
+   * that no member can finish it — a decision, not another wake.
+   */
+  readonly reclaimRetryLimit?: number
+  /**
    * File to append one status line to per change. Empty disables it.
    *
    * Use an absolute path: the host decides the working directory, and a
@@ -85,6 +94,7 @@ export const Config: z<Config> = z.object({
   halfOpenProbe: z.number().step(1).min(1).max(16).default(1),
   reclaimAfterMs: z.number().step(1).min(1_000).max(3_600_000).default(300_000),
   reclaimOnFailed: z.boolean().default(true),
+  reclaimRetryLimit: z.number().step(1).min(0).max(32).default(3),
   statusFile: z.string().default(''),
   statusHeartbeatMs: z.number().step(1).min(0).default(600_000),
 })
@@ -116,6 +126,18 @@ const DISPATCH_SCHEMA = {
   },
 } as const
 
+/** One parked task, as reported. */
+const PARK_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    taskId: { type: 'string', required: true },
+    reclaims: { type: 'integer', required: true },
+    previousOwner: { type: 'string', required: true },
+    at: { type: 'integer', required: true },
+  },
+} as const
+
 /** One team's row in the status output. */
 const TEAM_SCHEMA = {
   type: 'object',
@@ -129,6 +151,7 @@ const TEAM_SCHEMA = {
     skippedScope: { type: 'integer', required: true },
     skippedNoMember: { type: 'integer', required: true },
     skippedDeclined: { type: 'integer', required: true },
+    skippedParked: { type: 'integer', required: true },
     why: { type: 'array', items: { type: 'string' }, required: true },
     unclaimed: { type: 'integer', required: true },
     pending: { type: 'integer', required: true },
@@ -136,6 +159,7 @@ const TEAM_SCHEMA = {
     breakerTrips: { type: 'integer', required: true },
     breakerBlocked: { type: 'integer', required: true },
     reclaimed: { type: 'integer', required: true },
+    parked: { type: 'array', items: PARK_SCHEMA, required: true },
     tasks: { type: 'integer', required: true },
     inFlight: { type: 'integer', required: true },
     claimable: { type: 'integer', required: true },
@@ -178,6 +202,7 @@ const STATUS_SCHEMA = {
     skipped: { type: 'integer', required: true },
     unclaimed: { type: 'integer', required: true },
     reclaimed: { type: 'integer', required: true },
+    parked: { type: 'integer', required: true },
     teams: { type: 'array', items: TEAM_SCHEMA, required: true },
     caller: CALLER_SCHEMA,
     lastError: { type: 'string' },
@@ -246,6 +271,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     halfOpenProbe: config.halfOpenProbe ?? 1,
     reclaimAfterMs: Math.min(Math.max(config.reclaimAfterMs ?? 300_000, 1_000), 3_600_000),
     reclaimOnFailed: config.reclaimOnFailed ?? true,
+    reclaimRetryLimit: Math.min(Math.max(config.reclaimRetryLimit ?? 3, 0), 32),
     statusFile: config.statusFile ?? '',
     statusHeartbeatMs: config.statusHeartbeatMs ?? 600_000,
   }
@@ -263,6 +289,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     const skipped = teams.reduce((sum, team) => sum + team.skipped, 0)
     const unclaimed = teams.reduce((sum, team) => sum + team.unclaimed, 0)
     const reclaimed = teams.reduce((sum, team) => sum + team.reclaimed, 0)
+    const parked = teams.reduce((sum, team) => sum + team.parked.length, 0)
     const caller = readCallerBoard(ctx, agent, resolved)
     return {
       enabled: resolved.enabled,
@@ -273,6 +300,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       skipped,
       unclaimed,
       reclaimed,
+      parked,
       teams,
       ...caller === undefined ? {} : { caller },
       ...state.lastError === undefined ? {} : { lastError: state.lastError },
@@ -281,7 +309,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'team_autopilot_status',
-    description: 'Report the team-autopilot dispatch loop state: lifetime totals, a per-team breakdown, the calling team\'s live board, and the last reclaim/dispatch with their outcome.',
+    description: 'Report the team-autopilot dispatch loop state: lifetime totals, a per-team breakdown, the calling team\'s live board, and the last reclaim/dispatch with their outcome. Tasks parked after repeated reclaims are listed with the count that parked them.',
     parameters: {},
     output: {
       schema: STATUS_SCHEMA,
