@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.8] - 2026-10-28
+
+### 修复
+
+- **循环保活：一次宿主异常不再静默杀死调度器。** `loop()` 的 `while` 体里，`findLeads`（session recomposition 时 `tryMembership` 会抛）、`Promise.race`（change-wait 竞速）和 `pause` 都不在任何 `try` 内——任何一处 reject 都会一路传播到 `loop` 的 async 边界，`while` 永久退出，派发、回收、停派同时失效，而且 `lastError` 根本没机会写（它只在 `tick` 的 catch 里）。这是最坏的失效形态：静默。现在把整轮抽成 `runRound()`，外层 `while` 用一条 fence 兜住，失败记 `lastError` + 固定 2 秒退避（不用指数退避——那是留给「连续 send/wait 失败」的，recomposition 是毫秒级瞬态，重退避反而会把恢复后的宿主拖 30 秒）。`index.ts` 的 `void loop(...)` 再加一道 `.catch` 兜底。
+- **裁剪失败退避，防 O(n²) 无界增长。** 裁剪失败（Windows 上 `rename` 覆盖被 `tail` 类进程只读打开的文件会失败）被静默吞掉后，每轮 append 都重复「stat → 读整个超限文件 → 写一半 → 再失败」，日志无界增长且反复读整个文件。现在连续失败 3 次后停止重试裁剪，并写一行 `trim=failed` 让异常可见；一旦某次裁剪或低于上限的 stat 成功，计数归零。
+- **状态写入超时，观测不再能挂死调度循环。** `recordStatus` 的 `appendStatusLine` 在 tick 关键路径上，只承诺不抛错、没承诺不挂住——statusFile 落在网络盘或被 AV 扫描时，一次 append 就能拖垮整轮。现在用 `Promise.race` 加 2 秒超时，超时丢弃本行而非丢弃派发轮。
+
+### 测试
+
+- `integration` 26 → **29**：新增「宿主异常后循环保活并恢复」「状态写入超时不阻塞」「裁剪失败退避」三条。`appendStatusLine` 拆出 `appendStatusLineWith(path, line, fs)` 供测试注入失败宿主；`resetTrimFailures()` 导出供测试隔离进程级退避计数。
+
 ## [0.3.7] - 2026-10-28
 
 ### 新增

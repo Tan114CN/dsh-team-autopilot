@@ -326,7 +326,12 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.effect(() => {
     const controller = new AbortController()
     if (resolved.enabled) {
-      void loop(ctx, resolved, state, controller.signal)
+      // The loop fences every round and never exits on its own, so this catch
+      // is a last-resort net for anything that escapes the fence. It must not
+      // be able to take the dispatcher down silently.
+      void loop(ctx, resolved, state, controller.signal).catch((error: unknown) => {
+        state.lastError = error instanceof Error ? error.message : String(error)
+      })
     }
     return () => { controller.abort() }
   }, 'team-autopilot.loop()')

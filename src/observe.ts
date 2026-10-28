@@ -182,15 +182,63 @@ export function statusSignature(line: string): string {
  * @param line - the line to append, without a trailing newline.
  */
 export async function appendStatusLine(path: string, line: string): Promise<void> {
+  await appendStatusLineWith(path, line, fsOps)
+}
+
+/**
+ * File operations behind {@link appendStatusLine}, split out so the trim
+ * back-off can be tested against a host whose `rename` fails without touching
+ * the real filesystem.
+ */
+interface StatusFs {
+  append(path: string, data: string): Promise<void>
+  stat(path: string): Promise<{ size: number }>
+  read(path: string): Promise<string>
+  write(path: string, data: string): Promise<void>
+  rename(from: string, to: string): Promise<void>
+}
+
+/** The real filesystem, used in production. */
+const fsOps: StatusFs = {
+  append: (path, data) => appendFile(path, data, 'utf8'),
+  stat: async path => ({ size: (await stat(path)).size }),
+  read: path => readFile(path, 'utf8'),
+  write: (path, data) => writeFile(path, data, 'utf8'),
+  rename: (from, to) => rename(from, to),
+}
+
+/**
+ * Append one status line and trim the log when it grows past its ceiling.
+ *
+ * Split from {@link appendStatusLine} so tests can inject a failing host; the
+ * public entry point binds the real filesystem.
+ */
+export async function appendStatusLineWith(
+  path: string,
+  line: string,
+  fs: StatusFs,
+): Promise<void> {
   try {
-    await appendFile(path, `${line}\n`, 'utf8')
+    await fs.append(path, `${line}\n`)
   } catch {
     return
   }
+  // A trim that keeps failing must stop being retried every round. On Windows
+  // a `rename` over a file another process holds open (a `tail` that only
+  // shares read) fails, and retrying it every append turns the log into an
+  // unbounded, quadratically re-read file: each round stats, reads the whole
+  // over-limit file, writes a staged half, fails the rename, and swallows the
+  // error. Backing off after a few consecutive failures keeps the append cheap
+  // while the file is held, and a `trim=failed` line makes the condition
+  // visible instead of silent.
+  if (trimFailures >= TRIM_FAILURE_LIMIT) return
   try {
-    const info = await stat(path)
-    if (info.size <= MAX_BYTES) return
-    const lines = (await readFile(path, 'utf8')).split('\n')
+    const info = await fs.stat(path)
+    if (info.size <= MAX_BYTES) {
+      trimFailures = 0
+      return
+    }
+    const lines = (await fs.read(path)).split('\n')
     // Keep the trailing half: the newest rounds are the ones worth reading,
     // and halving avoids re-trimming on the very next append.
     const kept = lines.slice(Math.floor(lines.length / 2)).join('\n')
@@ -198,9 +246,46 @@ export async function appendStatusLine(path: string, line: string): Promise<void
     // the host dies mid-trim, and the log is often the only thing left to read
     // after a crash. Rename replaces the file atomically within one volume.
     const staged = `${path}.tmp`
-    await writeFile(staged, kept, 'utf8')
-    await rename(staged, path)
+    await fs.write(staged, kept)
+    await fs.rename(staged, path)
+    trimFailures = 0
   } catch {
-    // A failed trim only means the file keeps growing until the next attempt.
+    trimFailures += 1
+    if (trimFailures === TRIM_FAILURE_LIMIT) {
+      try {
+        await fs.append(path, 'trim=failed\n')
+      } catch {
+        // The log is already unwritable in this state; nothing more to do.
+      }
+    }
   }
+}
+
+/**
+ * Consecutive trim failures before the autopilot stops retrying the trim.
+ *
+ * A trim is attempted after every append once the file exceeds its ceiling,
+ * so a permanently failing trim would otherwise be retried on every round
+ * forever. This counter backs off after a handful of consecutive failures and
+ * is reset the moment a trim (or a sub-ceiling stat) succeeds.
+ */
+let trimFailures = 0
+
+/**
+ * How many consecutive trim failures back the autopilot off the trim path.
+ *
+ * Small on purpose: the point is to stop the quadratic re-read, not to wait
+ * out a transient hold for long.
+ */
+const TRIM_FAILURE_LIMIT = 3
+
+/**
+ * Reset the trim back-off counter.
+ *
+ * Exported for tests only: the counter is process-global (the autopilot runs
+ * once per host), so a test that drives the failure path must be able to start
+ * from a clean slate without leaking into the next test.
+ */
+export function resetTrimFailures(): void {
+  trimFailures = 0
 }

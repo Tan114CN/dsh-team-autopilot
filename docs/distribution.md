@@ -95,7 +95,7 @@ description:
 | `package.json` 声明 `dsh.bundle` | ✅ `{"bundle":{"patch":"./cordis.patch.yml"}}` |
 | `cordis.patch.yml` 存在于仓库根 | ✅ |
 | 发布的包 `repository` 指回本仓库 | ✅ `git+https://github.com/Tan114CN/dsh-team-autopilot.git` |
-| 真实可用代码、非占位 | ✅ 46 项 verify + 26 项 integration + 28 项验收全绿 |
+| 真实可用代码、非占位 | ✅ 46 项 verify + 29 项 integration + 28 项验收全绿 |
 | 仓库年龄 ≥ 1 天 | ⏳ **唯一未满足项**：`created_at=2026-10-27T18:17:09Z`，北京时间 10-29 02:17 起达标 |
 | 已加 `dsh-plugin` topic | ✅ 8 个已设（2026-10-28 复核） |
 

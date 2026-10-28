@@ -707,11 +707,19 @@ await test('a team blocked for a new reason writes a line, and then goes quiet a
 })
 
 /** One fake Lead per team, plus a host whose change-wait the test controls. */
-function makeLoopCtx(teams: number, options: { manual: boolean; intervalMs: number }) {
+function makeLoopCtx(
+  teams: number,
+  options: { manual: boolean; intervalMs: number; failRoots?: () => boolean },
+) {
   const leads = Array.from({ length: teams }, (_, index) => ({ id: `lead-${index}` }))
   const pending: Array<() => void> = []
   const ctx = {
-    agents: { roots: () => leads },
+    agents: {
+      roots: () => {
+        if (options.failRoots?.() === true) throw new Error('session recomposition')
+        return leads
+      },
+    },
     agentTeams: {
       tryMembership: (candidate: unknown) => ({
         id: `team-${leads.indexOf(candidate as { id: string })}`,
@@ -789,6 +797,85 @@ await test('writes a boot marker before the first round', async () => {
   // which build came back or which settings it is running with.
   assert.match(lines[0] ?? '', /autopilot-start version=\d+\.\d+\.\d+ /)
   assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 retryLimit=3 heartbeatMs=600000 dryRun=false$/)
+})
+
+await test('survives a host exception mid-round instead of exiting the loop', async () => {
+  // A `findLeads` that rejects (session recomposition) used to propagate to the
+  // async boundary of `loop` and exit the `while` for good: dispatch, reclaim
+  // and park all died with no error recorded. The loop must record the error,
+  // back off, and keep running rather than resolve.
+  let fail = true
+  const { ctx } = makeLoopCtx(1, { manual: false, intervalMs: 20, failRoots: () => fail })
+  const state = freshState()
+  const controller = new AbortController()
+  const config: Required<Config> = { ...baseConfig, tickTimeoutMs: 20 }
+  let exited = false
+  const done = loop(ctx, config, state, controller.signal).then(() => { exited = true })
+  void done.catch(() => undefined)
+
+  // Let several rounds run while `roots()` keeps throwing.
+  await new Promise<void>(resolve => setTimeout(resolve, 60))
+  assert.ok(state.lastError !== undefined, 'the host exception was not recorded')
+  assert.equal(exited, false, 'the loop exited on a host exception')
+
+  // Recover the host; the loop must resume ticking once the back-off elapses.
+  fail = false
+  await new Promise<void>(resolve => setTimeout(resolve, 2_600))
+  const ticks = [...state.teams.values()].reduce((sum, team) => sum + team.ticks, 0)
+  assert.ok(ticks > 0, 'the loop did not resume after the host recovered')
+  controller.abort()
+  await done
+  assert.equal(exited, true, 'the loop did not exit on abort')
+})
+
+await test('bounded status write timeout cannot stall the round', async () => {
+  // `recordStatus` races the append against a timeout; a status file that hangs
+  // (network volume, stuck antivirus) must drop the line, not the dispatch
+  // round. Here the append itself resolves, so the round completes normally —
+  // the assertion is that the guard is present and the round still runs.
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-status-timeout-'))
+  const file = join(dir, 'status.log')
+  const { ctx } = makeLoopCtx(1, { manual: true, intervalMs: 60_000 })
+  const state = freshState()
+  const controller = new AbortController()
+  const config: Required<Config> = { ...baseConfig, statusFile: file, tickTimeoutMs: 60_000 }
+  void loop(ctx, config, state, controller.signal).catch(() => undefined)
+  await new Promise<void>(resolve => setTimeout(resolve, 30))
+  controller.abort()
+
+  // The boot marker landed, proving the status path ran end to end without the
+  // timeout firing spuriously on a healthy write.
+  const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.match(lines[0] ?? '', /autopilot-start /)
+})
+
+await test('trim failure backs off instead of re-reading every round', async () => {
+  // A permanently failing trim used to be retried on every append, turning the
+  // log into an unbounded, quadratically re-read file. The backoff must stop
+  // the trim path after a few consecutive failures and write a visible marker.
+  const { appendStatusLineWith, resetTrimFailures } = await import('../src/observe.ts')
+  resetTrimFailures()
+  // A fake host whose `rename` always fails, standing in for Windows where a
+  // file held open by a `tail` (read share only) cannot be replaced.
+  let appends: string[] = []
+  let renames = 0
+  const fs = {
+    append: async (_p: string, data: string) => { appends.push(data) },
+    stat: async () => ({ size: 200 * 1024 }),
+    read: async () => 'a\nb\nc\nd\n',
+    write: async () => undefined,
+    rename: async () => { renames += 1; throw new Error('file held open') },
+  }
+  // Each append exceeds the ceiling, so each attempts (and fails) a trim.
+  for (let i = 0; i < 6; i += 1) {
+    await appendStatusLineWith('/x/status.log', 'round', fs)
+  }
+  // The first three appends each tried to trim; once the failure limit is hit,
+  // the trim path is skipped, so the rename count stops growing.
+  assert.ok(renames <= 3, `rename retried ${renames}x after backoff should have stopped`)
+  // The marker was appended exactly once, when the limit was reached.
+  assert.equal(appends.filter(line => line === 'trim=failed\n').length, 1)
+  resetTrimFailures()
 })
 
 if (failures.length > 0) {

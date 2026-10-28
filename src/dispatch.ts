@@ -165,8 +165,23 @@ async function recordStatus(config: Required<Config>, team: TeamState): Promise<
   if (signature === team.lastStatusSignature && quietFor < config.statusHeartbeatMs) return
   team.lastStatusSignature = signature
   team.lastStatusAt = now
-  await appendStatusLine(config.statusFile, line)
+  // Observation is a convenience and must never be able to stall the loop:
+  // a status file on a slow network volume or under a stuck antivirus scan can
+  // make one append hang forever, and this is on the tick critical path. A
+  // bounded race drops the line instead of dropping the dispatch round.
+  await Promise.race([
+    appendStatusLine(config.statusFile, line),
+    new Promise<void>(resolve => setTimeout(resolve, STATUS_WRITE_TIMEOUT_MS)),
+  ])
 }
+
+/**
+ * How long one status append may take before the round moves on without it.
+ *
+ * Not configurable on purpose: this is a guard on a convenience, and a value a
+ * user could tune would invite a wrong value that reintroduces the hang.
+ */
+const STATUS_WRITE_TIMEOUT_MS = 2_000
 
 /**
  * One dispatch round: read the whole board, decide, then wake.
@@ -607,12 +622,42 @@ export async function loop(
   }
 
   while (!signal.aborted) {
+    // The whole round is fenced so one host exception cannot silently kill the
+    // loop. `findLeads` (session recomposition), the change-wait race, and the
+    // per-team `tick` each touch the live agent registry, and any of them can
+    // reject while the host is recomposing sessions. Without this fence the
+    // rejection propagates to the async boundary of `loop`, the `while` exits,
+    // and dispatch, reclaim and park all die with no error recorded — the
+    // worst failure shape, a silent one.
+    try {
+      await runRound()
+    } catch (error: unknown) {
+      if (signal.aborted) return
+      state.lastError = describe(error)
+      // A round-level failure (resolving Leads, racing the change-waits) is
+      // usually transient — session recomposition settles in milliseconds — so
+      // it gets a fixed short pause, not the exponential back-off reserved for
+      // a host that keeps failing to send or to wait. Reusing `failures` here
+      // would let one recomposition spike the back-off to 30s and stall a
+      // recovered host for half a minute for no reason.
+      await pause(2_000, signal)
+      if (signal.aborted) return
+    }
+  }
+  return
+
+  /**
+   * One round: resolve Leads, arm waiters, wait for one edge, serve the teams
+   * that woke. Extracted so the whole thing sits under a single fence in the
+   * loop above.
+   */
+  async function runRound(): Promise<void> {
     const leads = findLeads(ctx)
     if (leads.length === 0) {
       waiters.clear()
       dirty.clear()
       await pause(2_000, signal)
-      continue
+      return
     }
 
     // Arm a waiter for every live team that has none, and replace any waiter
