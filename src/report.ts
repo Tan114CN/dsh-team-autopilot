@@ -32,6 +32,8 @@ export interface TeamReport {
   skippedScope: number
   /** Skips caused by there being no idle teammate left. */
   skippedNoMember: number
+  /** Skips caused by every idle teammate having already declined the task. */
+  skippedDeclined: number
   /** Wakes still unowned at the next board read. */
   unclaimed: number
   /** Circuit-breaker state for this team. */
@@ -132,7 +134,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
     const age = team.lastTickAt === undefined ? 'never' : `${Math.max(0, now - team.lastTickAt)}ms ago`
     lines.push(
       `  team=${team.team} ticks=${team.ticks} dispatched=${team.dispatched} suppressed=${team.suppressed}`
-      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember})`
+      + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined})`
       + ` breaker=${team.breaker} trips=${team.breakerTrips} held=${team.breakerBlocked}`
       + ` reclaimed=${team.reclaimed} unclaimed=${team.unclaimed}`
       + ` tasks=${team.tasks} inFlight=${team.inFlight} claimable=${team.claimable} idle=${team.idle} slots=${team.slots} (${age})`,
@@ -166,6 +168,15 @@ export function renderReport(report: StatusReport, now: number): string[] {
       lines.push(
         `    warning: ${team.unclaimed} wakes went unclaimed — a member that never claims`
         + ' holds the dispatch channel while its task stays in the pool',
+      )
+    }
+    // Every idle member has already had this task and passed. Dispatch has
+    // stopped on purpose: repeating the wake would burn tokens without ever
+    // reaching a member that accepts, so the fix is human.
+    if (team.skippedDeclined > 0) {
+      lines.push(
+        `    note: ${team.skippedDeclined} skips because every idle member already declined`
+        + ' — dispatch is holding back rather than re-waking the same members',
       )
     }
   }

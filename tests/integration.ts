@@ -334,9 +334,13 @@ await test('counts a wake that nobody claimed', async () => {
   const team = teamOf(state)
   assert.equal(team.unclaimed, 1)
   assert.equal(team.lastDispatch?.claimed, false)
-  // The repeat is counted on the same record rather than replacing it, so the
-  // outcome survives instead of reading "unchecked" forever.
-  assert.equal(team.lastDispatch?.repeats, 2)
+  // The refused hand-off is *not* repeated. Alice is the only member, so this
+  // round finds nobody left to offer it to and holds the wake back rather than
+  // burning another message on the same refusing member — `repeats` stays 1,
+  // describing the one wake that actually happened.
+  assert.equal(team.lastDispatch?.repeats, 1)
+  assert.deepEqual(host.sent, ['alice'], 'a refusing member is not woken twice')
+  assert.equal(team.skippedDeclined, 1, 'the skip is attributed to refusals, not to a missing member')
 
   // She claims it before the third read: that wake is judged answered.
   const woken = host.tasks[0]
@@ -344,11 +348,41 @@ await test('counts a wake that nobody claimed', async () => {
   Object.assign(woken, { status: 'in_progress', ownerName: 'alice' })
   await tick(ctx, lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
   assert.equal(teamOf(state).unclaimed, 1, 'an answered wake adds nothing')
-  assert.equal(teamOf(state).lastDispatch?.claimed, true)
+  // The record still describes that one wake, which genuinely went unclaimed;
+  // a later claim by the same member does not rewrite the outcome.
+  assert.equal(teamOf(state).lastDispatch?.claimed, false)
+  assert.equal(teamOf(state).declined.size, 0, 'an owned task clears its refusal slate')
 
   // A round that wakes nobody judges nothing: unclaimed counts wakes, not rounds.
   await tick(ctx, lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
   assert.equal(teamOf(state).unclaimed, 1)
+})
+
+await test('hands a refused task to the next idle member', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const ctx = makeCtx(host)
+  await tick(ctx, lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['alice'], 'roster order picks alice first')
+
+  // Alice ignores the wake while bob sits idle. Without the refusal record
+  // this round would wake alice again and bob would never get a turn.
+  await tick(ctx, lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['alice', 'bob'], 'the refusal hands the task to the next member')
+  assert.equal(teamOf(state).unclaimed, 1)
+  assert.equal(teamOf(state).lastDispatch?.memberName, 'bob')
+  assert.equal(teamOf(state).skippedDeclined, 0, 'someone was still available, so nothing was skipped')
+
+  // Bob claims it: the task changed hands, so the refusal slate is cleared.
+  const woken = host.tasks[0]
+  assert.ok(woken !== undefined)
+  Object.assign(woken, { status: 'in_progress', ownerName: 'bob' })
+  await tick(ctx, lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).lastDispatch?.claimed, true)
+  assert.equal(teamOf(state).declined.size, 0)
 })
 
 await test('does not count a wake that was answered', async () => {

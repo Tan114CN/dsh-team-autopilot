@@ -28,7 +28,7 @@ export interface BlockedTask {
    * "is this team blocked by write scopes, or simply out of members?" — two
    * problems with opposite fixes.
    */
-  readonly kind: 'scope' | 'noMember'
+  readonly kind: 'scope' | 'noMember' | 'declined'
   /** Human-readable cause. */
   readonly reason: string
 }
@@ -40,10 +40,17 @@ export interface PlanInput {
   /** Upper bound of concurrently in-flight tasks. */
   readonly maxConcurrent: number
   /**
-   * Task id to a member that must not receive that task this round — a task
-   * just reclaimed from a member is not handed straight back to them.
+   * Task id to the members that must not receive that task this round.
+   *
+   * Two causes share this channel because both mean the same thing at
+   * decision time — "this member already had its turn on this task":
+   *  - a task just reclaimed from a member is not handed straight back to
+   *    them in the same round;
+   *  - a member that was woken and did not claim is skipped on later rounds,
+   *    so a teammate that never accepts cannot hold the channel forever
+   *    while an idle colleague waits for a turn.
    */
-  readonly avoid?: ReadonlyMap<string, string>
+  readonly avoid?: ReadonlyMap<string, ReadonlySet<string>>
 }
 
 /** One autopilot decision round. */
@@ -256,21 +263,21 @@ export function availableMembers(
  * Pick the teammate for one plan.
  *
  * Members already committed this round are skipped, so one round never
- * plans the same teammate twice, and a task that was just reclaimed from
- * a member does not go straight back to that member.
+ * plans the same teammate twice, and every member in `skip` is passed over
+ * — a task taken back from a member, or one that member already ignored.
  * @param free - teammates eligible for new work, in roster order.
  * @param used - names already committed to a plan this round.
- * @param skip - one member to avoid, if any.
+ * @param skip - members to avoid for this task, if any.
  * @returns the chosen teammate, or undefined when none is left.
  */
 function pickMember(
   free: readonly TeamMemberView[],
   used: ReadonlySet<string>,
-  skip: string | undefined,
+  skip: ReadonlySet<string> | undefined,
 ): TeamMemberView | undefined {
   for (const member of free) {
     if (used.has(member.name)) continue
-    if (skip !== undefined && member.name === skip) continue
+    if (skip !== undefined && skip.has(member.name)) continue
     return member
   }
   return undefined
@@ -310,9 +317,20 @@ export function planDispatch(input: PlanInput): PlanResult {
       continue
     }
 
-    const member = pickMember(free, used, input.avoid?.get(task.id))
+    const skip = input.avoid?.get(task.id)
+    const member = pickMember(free, used, skip)
     if (member === undefined) {
-      blocked.push({ taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' })
+      // Telling the two causes apart matters: "no idle teammate" is fixed by
+      // adding a member, "everyone declined" by looking at why the existing
+      // ones stop accepting.
+      const hadCandidate = free.some(entry => !used.has(entry.name))
+      blocked.push(hadCandidate
+        ? {
+            taskId: task.id,
+            kind: 'declined',
+            reason: `every idle teammate already declined this task (${[...skip ?? []].join(', ')})`,
+          }
+        : { taskId: task.id, kind: 'noMember', reason: 'no idle teammate available' })
       continue
     }
     used.add(member.name)

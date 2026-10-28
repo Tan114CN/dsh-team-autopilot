@@ -12,7 +12,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import type { Config } from './index.ts'
 import { findLeads } from './lead.ts'
-import { boardSummary, planDispatch, wakeMessage } from './select.ts'
+import { boardSummary, claimableTasks, planDispatch, wakeMessage } from './select.ts'
 import type { DispatchPlan } from './select.ts'
 import { planReclaim } from './reclaim.ts'
 import {
@@ -197,7 +197,19 @@ export async function tick(
       || woken.status === 'completed'
       || woken.ownerName != null
     previous.claimed = owned
-    if (!owned) team.unclaimed += 1
+    if (owned) {
+      // The task moved on, so this member's turn on it is settled: any
+      // earlier refusal no longer says anything about the current situation.
+      team.declined.delete(previous.taskId)
+    } else {
+      team.unclaimed += 1
+      // Remember the refusal so the next round offers the task to somebody
+      // else. Without this the member keeps its roster position and takes
+      // the dispatch channel round after round while a colleague idles.
+      const declined = team.declined.get(previous.taskId)
+      if (declined === undefined) team.declined.set(previous.taskId, new Set([previous.memberName]))
+      else declined.add(previous.memberName)
+    }
   }
 
   // Budget is keyed by the real Team identity (root-Session-backed TeamId),
@@ -253,13 +265,38 @@ export async function tick(
     tasks = ctx.agentTeams.listTasks(lead)
     members = ctx.agentTeams.listMembers(lead)
   }
-  // A task taken back from a member is not handed straight back to that
-  // same member in the round that reclaimed it: the point of the reclaim
-  // is to give someone else a turn. Across rounds the task is free again
-  // — a member that was merely slow deserves another chance.
-  const takenFrom = new Map<string, string>()
+  // Two different situations both mean "this member already had its turn on
+  // this task", so they travel down one channel:
+  //  - it was reclaimed from that member this very round, and the point of a
+  //    reclaim is to give somebody else a turn;
+  //  - it was woken for that member in an earlier round and never claimed
+  //    (recorded in `team.declined`). Without this, a member that ignores
+  //    every wake keeps its roster position and holds the dispatch channel
+  //    forever while an idle colleague never gets a chance.
+  const avoid = new Map<string, Set<string>>()
+  const addAvoid = (taskId: string, memberName: string): void => {
+    const existing = avoid.get(taskId)
+    if (existing === undefined) avoid.set(taskId, new Set([memberName]))
+    else existing.add(memberName)
+  }
   for (const target of reclaim.releases) {
-    takenFrom.set(String(target.taskId), target.previousOwner)
+    const taskId = String(target.taskId)
+    addAvoid(taskId, target.previousOwner)
+    // A reclaim means the task changed hands, so earlier refusals from other
+    // members were formed under different circumstances — clear that slate
+    // rather than carrying a stale grudge into the new situation.
+    team.declined.delete(taskId)
+  }
+  // Forget refusals for tasks that are no longer up for grabs: an owned or
+  // finished task has nothing left to decide, and a refusal recorded against
+  // it would otherwise linger and mis-fire if the id were ever reused. This
+  // also keeps the map bounded by the tasks actually in play.
+  const upForGrabs = new Set(claimableTasks(tasks).map(entry => String(entry.id)))
+  for (const taskId of [...team.declined.keys()]) {
+    if (!upForGrabs.has(taskId)) team.declined.delete(taskId)
+  }
+  for (const [taskId, names] of team.declined) {
+    for (const name of names) addAvoid(taskId, name)
   }
 
   // `planDispatch` and `boardSummary` share one in-flight rule, so the
@@ -268,7 +305,7 @@ export async function tick(
     tasks,
     members,
     maxConcurrent: budget,
-    avoid: takenFrom,
+    avoid,
   })
   const summary = boardSummary(tasks, members, budget)
 
@@ -287,6 +324,7 @@ export async function tick(
   team.skipped += blocked.length
   for (const entry of blocked) {
     if (entry.kind === 'scope') team.skippedScope += 1
+    else if (entry.kind === 'declined') team.skippedDeclined += 1
     else team.skippedNoMember += 1
   }
   team.lastTickAt = Date.now()

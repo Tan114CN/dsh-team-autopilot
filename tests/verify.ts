@@ -215,6 +215,35 @@ test('blocked tasks carry a machine-readable kind', () => {
   assert.equal(noMember.blocked[0]?.kind, 'noMember')
 })
 
+test('planDispatch skips members that already declined a task', () => {
+  const board = [task({ id: 't1' })]
+  const roster = [member('alice', 'inactive'), member('bob', 'inactive')]
+  // Alice keeps her roster position, so only the refusal record stops her
+  // from taking the task a second time.
+  const result = planDispatch({
+    tasks: board,
+    members: roster,
+    maxConcurrent: 4,
+    avoid: new Map([['t1', new Set(['alice'])]]),
+  })
+  assert.equal(result.plans.length, 1)
+  assert.equal(result.plans[0]?.memberName, 'bob', 'the next idle member gets the turn')
+})
+
+test('planDispatch reports a task nobody is left to take as declined', () => {
+  // The difference from `noMember` matters: adding a member fixes one, while
+  // the other means everyone present already had a turn and passed.
+  const result = planDispatch({
+    tasks: [task({ id: 't1' })],
+    members: [member('alice', 'inactive')],
+    maxConcurrent: 4,
+    avoid: new Map([['t1', new Set(['alice'])]]),
+  })
+  assert.equal(result.plans.length, 0)
+  assert.equal(result.blocked[0]?.kind, 'declined')
+  assert.match(result.blocked[0]?.reason ?? '', /alice/)
+})
+
 test('wakeMessage tells the member to claim with the revision', () => {
   const plan: DispatchPlan = {
     taskId: 't1',
@@ -464,6 +493,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         skipped: 0,
         skippedScope: 0,
         skippedNoMember: 0,
+        skippedDeclined: 0,
         unclaimed: 0,
         breaker: 'closed',
         breakerTrips: 0,
@@ -515,6 +545,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         skipped: 1,
         skippedScope: 1,
         skippedNoMember: 0,
+        skippedDeclined: 0,
         unclaimed: 2,
         breaker: 'closed',
         breakerTrips: 0,
@@ -546,7 +577,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   }
   const text = renderReport(report, 3_000).join('\n')
   // The skip total is broken down, so the two opposite fixes are told apart.
-  assert.match(text, /skipped=1 \(scope=1 noMember=0\)/)
+  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0\)/)
   // Which task came back, from whom, and why — not just "reclaimed=2".
   assert.match(text, /lastReclaim task=task-3 from=worker-a reason='owner "worker-a" inactive for 60012ms' applied \(500ms ago\)/)
   // Which task went to whom, how many times, and whether it was picked up.

@@ -119,7 +119,7 @@ tick 由 `waitForChange(lead, tickTimeoutMs, signal)` 驱动：有团队变化�
 ## 10. 已知限制（验证时别当成 bug）
 
 1. **stalled 表在内存**：插件重启后所有任务的 grace 期重新计时。
-2. **跨轮无成员级冷却**：若某成员反复僵死，任务回池后再被派回它，会以 `reclaimAfterMs` 为周期循环。不会更糟（那任务本来就完不成），但会持续产生唤醒消息。**已在真机撞到**：task-3 的 revision 从 3 爬到 20（约 8–9 轮回收 + 认领）。现在这条循环在 status 里直接可见——`unclaimed` 递增、`lastDispatch wakes=N`、`lastReclaim` 反复指同一任务；验证时别再靠数 revision 反推。
+2. **拒绝记录是任务级，不是成员级**：某任务派给某成员未被认领后，该成员在这**一个**任务上被跳过，其它任务照常派给它。若它对所有任务都不接，那些任务会各自停派（`declined` 上涨 + note 行），要恢复得让任务易手。此前「任务回池后被反复派回同一成员」的循环（真机撞到：task-3 的 revision 从 3 爬到 20，约 8–9 轮）已由此消除；循环期间仍可用 `unclaimed` / `lastDispatch wakes=N` / `lastReclaim` 三条互相印证。
 3. **回收失败不熔断**：只写 `lastError`，下一轮重试。
 
 ## 11. 验证后回填

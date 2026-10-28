@@ -85,6 +85,21 @@ export interface TeamState {
   skippedScope: number
   /** Skips caused by there being no idle teammate left. */
   skippedNoMember: number
+  /** Skips caused by every idle teammate having already declined the task. */
+  skippedDeclined: number
+  /**
+   * Members per task that were woken and did not claim, carried across rounds.
+   *
+   * A member keeps its roster position when it ignores a wake, so without this
+   * record the same task is handed to the same member round after round while
+   * an idle colleague never gets a turn. Cleared as soon as the task changes
+   * hands (claimed, completed, or reclaimed) — a member that was merely
+   * starting up deserves another chance once the situation has moved.
+   *
+   * Internal bookkeeping: it never reaches the report, which shows the
+   * outcome of the decision rather than the machinery behind it.
+   */
+  declined: Map<string, Set<string>>
   /**
    * Wakes that were still unowned at the next board read.
    *
@@ -173,6 +188,8 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     skipped: 0,
     skippedScope: 0,
     skippedNoMember: 0,
+    skippedDeclined: 0,
+    declined: new Map(),
     unclaimed: 0,
     breaker: 'closed',
     breakerTrips: 0,

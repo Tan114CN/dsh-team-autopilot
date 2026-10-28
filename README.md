@@ -315,7 +315,7 @@ autopilot active
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
 caller team=<id> tasks=N inFlight=N claimable=N idle=N slots=N (live)
 teams=N
-  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N)
+  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N)
   breaker=<state> trips=N held=N reclaimed=N unclaimed=N
   tasks=N inFlight=N claimable=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
@@ -326,7 +326,7 @@ teams=N
 
 | 字段 | 回答什么 | 为什么必须有 |
 |---|---|---|
-| `skipped (scope=N noMember=N)` | 任务为什么没派出去 | 「写域冲突」要放宽写域，「没有空闲成员」要加人——两个相反的处置。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
+| `skipped (scope=N noMember=N declined=N)` | 任务为什么没派出去 | 三种原因三种处置：写域冲突要放宽写域、没有空闲成员要加人、全员拒绝要看成员为什么不接。只有一个 `skipped` 总数时，读者得回头翻日志才能分辨 |
 | `lastReclaim`（task / from / reason / 时刻） | 刚刚收回的是哪个任务、从谁手里、为什么 | 只有 `reclaimed=2` 时，判断「是不是同一个任务在循环」只能靠任务的 revision 数字往上爬来反推 |
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
@@ -334,6 +334,14 @@ teams=N
 `outcome` 的判定发生在**下一次读板**时：唤醒发出去的瞬间，成功与「没人接」在观测上完全相同。同一任务同一成员再次被唤醒时不另开记录，而是累加 `wakes` 并保留上一次的判定——否则每轮一覆盖，这个字段将永远显示 `unchecked`，循环反而看不见。`unclaimed` 每次唤醒只计一次，不按轮累加（任务滞留期间会有很多轮）。
 
 `unclaimed >= 2` 时报告会多打一行 warning，直接点出「有成员从不接活」。
+
+### `outcome=unclaimed` 会改变下一轮的决策
+
+它不只是个数字。任务派给某成员后未被认领，该成员就被记进**这个任务的拒绝集合**，下一轮改派下一个空闲成员——否则那个成员按 roster 顺序永远排第一，同事全程空转，任务原地不动。
+
+全部空闲成员都拒绝过时，派发**主动停手**：`declined` 计数上涨并打一行 note，而不是继续对着同一批成员重复唤醒烧 token。这是刻意的取舍——循环每轮都发消息且掩盖问题，停手不花钱且一眼看得见。
+
+任务一旦易手（被认领、完成、或回收回池），该任务的拒绝记录立即清空，避免把一次「当时正忙」记成永久黑名单。
 
 ## 边界
 
@@ -344,7 +352,7 @@ teams=N
 - **尚未做**（都是官方书面声明的空档，但本插件当前未实现）：**投递确认**与**团队 token 预算闸**。注意现有的 `maxConcurrent` / `teamBudgets` 是**并发**预算，不是花钱预算。
   - 投递确认做不了，不只是「官方不保证重试」：`team/message/queued` 与 `team/message/delivered` 的 schema 仍在（历史可读），但 **Team 已不再写入这两种事件**（解包核实：包内无任何 append 点）。没有 delivered 事件就无法确认对方收到，剩下的只有「`sendMessage` 抛错后重试」——那是发送重试，不是投递确认。
 - **明确不做**（判据均为源码层）：**质量门**（验收属语义判断，与确定性定位冲突，且不在派发 tick 职责内）、**toolPolicies**（按角色限制工具需要拦截层，官方只提供 `ctx.approval` 一次性人工批准，没有暴露策略接口）、**per-member model**（Team 层 `spawn_teammate` 不转发 `agentOptions`）。
-- **回收的已知边界**：跨轮不设成员级冷却。若某个成员反复僵死，任务收回池后再被派回它，会以 `reclaimAfterMs` 为周期循环——不会更糟（该任务本来就完不成），但会持续产生唤醒消息。这条在真机上已实际撞到（`rev 3 → rev 20`，约 8–9 轮），现在靠 `unclaimed` 与 `lastDispatch wakes=N` 可以直接看出循环，不必再数 revision。修复（成员级冷却 / 未认领换人）属于派发行为变更，尚未做
+- **回收的边界**：`avoid` 与拒绝集合都是**任务级**，不是成员级冷却——同一个成员仍可能被派到别的任务。若某成员对**所有**任务都不接，它会在每个任务上各被记录一次，那些任务最终各自停派（`declined`），要恢复得让任务易手（被认领、完成或回收）。真机上撞到的 `rev 3 → rev 20` 循环（同一任务反复派回同一成员、约 8–9 轮）已由此消除
 
 ## 官方会不会把这些做了
 
