@@ -9,3 +9,5 @@ coverage/
 .DS_Store
 Thumbs.db
 .workbuddy/
+# 真机验证时成员往里写文件；写域软锁测试用同一片目录，不该污染仓库状态
+.autopilot-scratch/
