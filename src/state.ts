@@ -39,11 +39,26 @@ export interface ReclaimRecord {
 }
 
 /**
+ * A wake that has been sent and is still owed its post-wake check.
+ *
+ * `at` is what makes the check honest. The board looks the same whether a
+ * member is about to claim or never will, so the answer only exists after the
+ * member has had a fair chance to react — the check waits for the wake's
+ * cooldown instead of running on the very next read.
+ */
+export interface PendingWake {
+  /** Member that was woken for this task. */
+  memberName: string
+  /** Epoch milliseconds the wake was sent. */
+  at: number
+}
+
+/**
  * One dispatch the autopilot performed.
  *
- * `claimed` is filled in on the *next* board read: a wake that is never
- * answered looks identical to a successful one at the moment it is sent, and
- * only the next round can tell them apart.
+ * `claimed` is filled in on a later board read — once the wake's cooldown has
+ * expired: a wake that is never answered looks identical to a successful one
+ * at the moment it is sent, and only time tells them apart.
  */
 export interface DispatchRecord {
   /** Id of the task that was handed out. */
@@ -137,14 +152,17 @@ export interface TeamState {
   /** This team's most recent dispatch, if any. */
   lastDispatch?: DispatchRecord
   /**
-   * Whether `lastDispatch` still owes its post-wake check.
+   * Wakes that are still owed a post-wake check, keyed by task id.
    *
-   * A wake can only be judged once — counting "still unowned" on every
-   * subsequent round would inflate the number with rounds in which no wake
-   * was even sent. This flag is internal bookkeeping and never leaves the
-   * state bucket: the report shows the outcome, not the machinery.
+   * Per task rather than a single flag: one round can wake several members at
+   * once, and each of those hand-offs owes its own answer. With a single flag
+   * every wake but the last one in a round was silently never judged, so a
+   * member that ignored its task was never recorded as having refused it.
+   *
+   * Internal bookkeeping only — the report shows the outcome, not the
+   * machinery.
    */
-  lastDispatchPending: boolean
+  pendingWakes: Map<string, PendingWake>
   /**
    * Everything the last written status line said except its timestamp and tick
    * count, so an unchanged round can be recognised without writing it.
@@ -214,7 +232,7 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     idle: 0,
     slots: 0,
     lastTickAt: undefined,
-    lastDispatchPending: false,
+    pendingWakes: new Map(),
     lastStatusSignature: undefined,
     lastStatusAt: undefined,
   }

@@ -218,7 +218,7 @@ rm -rf node_modules/dsh-team-autopilot
 | `dispatched` | 成功派发次数（dryRun 下也会计数） |
 | `suppressed` | 被冷却窗口抑制的次数 |
 | `skipped` | 被跳过的任务数（累计），括号里拆成 `scope`（写域冲突）/ `noMember`（无空闲成员）/ `declined`（空闲成员全都拒绝过这个任务） |
-| `unclaimed` | 唤醒后下一次读板时仍无主的次数；持续上涨 = 有成员从不接活 |
+| `unclaimed` | 唤醒后**过了冷却窗口**仍无主的次数；持续上涨 = 有成员从不接活。刚唤醒的几秒内不会判定，这是刻意的 |
 | `tasks` | 任务总数，**恒等于** `inFlight + claimable + blocked + done` |
 | `blocked` | `pending`、未 `ready`、且无 owner —— 卡在依赖上的任务 |
 | `done` | `completed` 或 `deleted` |

@@ -414,6 +414,66 @@ await test('hands a refused task to the next idle member', async () => {
   assert.equal(teamOf(state).declined.size, 0)
 })
 
+await test('does not judge a wake before the member had time to answer', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const ctx = makeCtx(host)
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 30_000 }
+  const lastWake = new Map<string, number>()
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['alice'])
+
+  // The next read arrives on a change edge, one second later. Alice has not
+  // had time to answer, so this round must judge nothing: on a real host this
+  // is the read that used to count every wake as ignored.
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  const team = teamOf(state)
+  assert.equal(team.unclaimed, 0, 'a member still thinking is not a refusal')
+  assert.equal(team.declined.size, 0, 'so nothing is held against her')
+  assert.equal(team.pendingWakes.size, 1, 'the wake is still owed its check')
+  assert.deepEqual(host.sent, ['alice'], 'and the task is not offered to bob meanwhile')
+
+  // Age the wake past the cooldown, which is when the answer can first change
+  // a decision. Now the round judges it, and only now.
+  const pending = team.pendingWakes.get('t1')
+  assert.ok(pending !== undefined)
+  pending.at = Date.now() - 31_000
+  lastWake.set('t1', Date.now() - 31_000)
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).unclaimed, 1)
+  assert.equal(teamOf(state).declined.get('t1')?.has('alice'), true)
+  assert.deepEqual(host.sent, ['alice', 'bob'], 'the refusal hands the task to the next member')
+})
+
+await test('judges every wake a round sent, not just the last one', async () => {
+  const host = makeHost(
+    [
+      task({ id: 't1', status: 'pending', ready: true }),
+      task({ id: 't2', status: 'pending', ready: true }),
+    ],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const ctx = makeCtx(host)
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 30_000 }
+  const lastWake = new Map<string, number>()
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.deepEqual(host.sent, ['alice', 'bob'], 'both tasks go out in the same round')
+
+  const team = teamOf(state)
+  assert.equal(team.pendingWakes.size, 2, 'both hand-offs are owed a check')
+
+  // Neither is claimed. Once the cooldown passes, each wake is judged on its
+  // own account — with a single pending flag only the last one survived.
+  for (const wake of team.pendingWakes.values()) wake.at = Date.now() - 31_000
+  for (const taskId of lastWake.keys()) lastWake.set(taskId, Date.now() - 31_000)
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).unclaimed, 2, 'one ignored wake per task, not per round')
+})
+
 await test('does not count a wake that was answered', async () => {
   const host = makeHost(
     [task({ id: 't1', status: 'pending', ready: true })],

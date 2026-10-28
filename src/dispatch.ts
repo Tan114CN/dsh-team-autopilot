@@ -106,8 +106,8 @@ function recordDispatch(team: TeamState, plan: DispatchPlan, now: number, sent: 
       sent,
     }
   }
-  // This wake has not been judged yet; the next board read decides it.
-  team.lastDispatchPending = true
+  // This wake leaves an entry behind; a later board read settles it.
+  team.pendingWakes.set(plan.taskId, { memberName: plan.memberName, at: now })
 }
 
 /**
@@ -222,36 +222,44 @@ export async function tick(
   let tasks: TeamTaskView[] = ctx.agentTeams.listTasks(lead)
   let members: TeamMemberView[] = ctx.agentTeams.listMembers(lead)
 
-  // Resolve the previous wake *before* this round moves anything. A wake that
-  // nobody answers is indistinguishable from a successful one at the moment it
-  // is sent — only the next board read can tell them apart. Repeated misses
-  // are the signature of a member that never claims: it keeps occupying the
-  // dispatch channel while the task sits in the pool.
+  // Settle the wakes that are now old enough to be judged. A wake that nobody
+  // answers is indistinguishable from a successful one at the moment it is
+  // sent — but "old enough" is load-bearing. The board reads the same whether a
+  // member is about to claim or never will, so a check that runs on the very
+  // next read judges the member's *thinking time*, not its answer. On a real
+  // host that read can be one second after the wake, which counted every wake
+  // as ignored, blacklisted members that were about to claim, and handed their
+  // task to a colleague who then duplicated the work.
+  //
+  // The cooldown is the right clock because it is the earliest moment the
+  // answer can change a decision: the task cannot be offered to anybody else
+  // before it expires, so judging earlier buys nothing and costs accuracy.
   //
   // Judged once per wake, not once per round: a task left in the pool is
   // re-observed every round, and counting each of those rounds would report
   // the team, not the wake.
-  const previous = team.lastDispatch
-  if (previous !== undefined && team.lastDispatchPending) {
-    team.lastDispatchPending = false
-    const woken = tasks.find(entry => String(entry.id) === previous.taskId)
+  const settleAt = Date.now()
+  for (const [taskId, wake] of [...team.pendingWakes]) {
+    if (settleAt - wake.at < config.wakeCooldownMs) continue
+    team.pendingWakes.delete(taskId)
+    const woken = tasks.find(entry => String(entry.id) === taskId)
     // Completed work is a success even if the owner has since been cleared.
     const owned = woken === undefined
       || woken.status === 'completed'
       || woken.ownerName != null
-    previous.claimed = owned
+    if (team.lastDispatch?.taskId === taskId) team.lastDispatch.claimed = owned
     if (owned) {
       // The task moved on, so this member's turn on it is settled: any
       // earlier refusal no longer says anything about the current situation.
-      team.declined.delete(previous.taskId)
+      team.declined.delete(taskId)
     } else {
       team.unclaimed += 1
       // Remember the refusal so the next round offers the task to somebody
       // else. Without this the member keeps its roster position and takes
       // the dispatch channel round after round while a colleague idles.
-      const declined = team.declined.get(previous.taskId)
-      if (declined === undefined) team.declined.set(previous.taskId, new Set([previous.memberName]))
-      else declined.add(previous.memberName)
+      const declined = team.declined.get(taskId)
+      if (declined === undefined) team.declined.set(taskId, new Set([wake.memberName]))
+      else declined.add(wake.memberName)
     }
   }
 
