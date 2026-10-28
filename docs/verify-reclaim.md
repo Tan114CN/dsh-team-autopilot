@@ -10,7 +10,7 @@
 
 ```
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
-  team=<id> ... reclaimed=N unclaimed=N
+  team=<id> ... reclaimed=N unclaimed=N pending=N
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed (<age>)
 ```

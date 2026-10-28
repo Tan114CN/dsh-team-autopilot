@@ -84,6 +84,15 @@ export interface DispatchRecord {
   claimed?: boolean
 }
 
+/**
+ * Why a ready task went untaken in one round.
+ *
+ * Three causes, three opposite fixes: widen the write scopes, add a member, or
+ * ask the member why it is not taking work. A closed union on purpose — a typo
+ * must not be able to invent a fourth cause that nobody knows how to act on.
+ */
+export type SkipKind = 'scope' | 'noMember' | 'declined'
+
 /** One team's observable counters and the board as of its last tick. */
 export interface TeamState {
   /** Stable team identity: the `TeamId` of the team's root session. */
@@ -102,6 +111,19 @@ export interface TeamState {
   skippedNoMember: number
   /** Skips caused by every idle teammate having already declined the task. */
   skippedDeclined: number
+  /**
+   * Why the **last** round skipped ready tasks, deduplicated and sorted.
+   *
+   * The four counters above are cumulative, so they climb on every round a
+   * task goes untaken and say nothing about the round in hand — which is why
+   * they are excluded from the status signature. This set is the round's own
+   * answer, and it changes only when the reason changes. That makes it the one
+   * piece of skip information that is both quiet and worth reporting: "this
+   * team started being blocked by write scopes" and "the last member just
+   * refused, so dispatch has stopped" both land on an operator immediately,
+   * instead of waiting for the heartbeat.
+   */
+  skipKinds: SkipKind[]
   /**
    * Members per task that were woken and did not claim, carried across rounds.
    *
@@ -159,8 +181,10 @@ export interface TeamState {
    * every wake but the last one in a round was silently never judged, so a
    * member that ignored its task was never recorded as having refused it.
    *
-   * Internal bookkeeping only — the report shows the outcome, not the
-   * machinery.
+   * Bookkeeping plus one number: the report shows *how many* wakes are still
+   * owed an answer, never which member or task they belong to. The count is
+   * the part an operator can act on — "two wakes are in flight right now" is
+   * invisible from a `lastDispatch` that can only remember one of them.
    */
   pendingWakes: Map<string, PendingWake>
   /**
@@ -218,6 +242,7 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     skippedScope: 0,
     skippedNoMember: 0,
     skippedDeclined: 0,
+    skipKinds: [],
     declined: new Map(),
     unclaimed: 0,
     breaker: 'closed',

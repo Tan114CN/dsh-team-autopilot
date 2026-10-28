@@ -165,6 +165,7 @@ const warm = {
     skippedNoMember: 0,
     skippedDeclined: 0,
     unclaimed: 1,
+    pending: 1,
     breaker: 'closed',
     breakerTrips: 0,
     breakerBlocked: 0,

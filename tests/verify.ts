@@ -31,7 +31,7 @@ import { renderReport } from '../src/report.ts'
 import type { StatusReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { planReclaim } from '../src/reclaim.ts'
-import { startupLine, statusLine } from '../src/observe.ts'
+import { startupLine, statusLine, statusSignature } from '../src/observe.ts'
 import { teamState } from '../src/state.ts'
 import { createAutopilotState } from '../src/state.ts'
 
@@ -544,6 +544,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         skippedNoMember: 0,
         skippedDeclined: 0,
         unclaimed: 0,
+        pending: 0,
         breaker: 'closed',
         breakerTrips: 0,
         breakerBlocked: 0,
@@ -604,6 +605,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         skippedNoMember: 0,
         skippedDeclined: 0,
         unclaimed: 2,
+        pending: 1,
         breaker: 'closed',
         breakerTrips: 0,
         breakerBlocked: 0,
@@ -742,7 +744,10 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   assert.match(idle, /^1970-01-01T00:00:00\.000Z team=team-a /)
   assert.match(idle, /ticks=3 dispatched=1 suppressed=0 /)
   assert.match(idle, /skip=2 scope=1 noMember=0 declined=1 /)
-  assert.match(idle, /unclaimed=1 reclaimed=0 tasks=2 inFlight=0 claimable=1 blocked=1 done=0 idle=2 slots=2 /)
+  assert.match(idle, /unclaimed=1 pending=0 reclaimed=0 tasks=2 inFlight=0 claimable=1 blocked=1 done=0 idle=2 slots=2 /)
+  // "Nothing was skipped" is printed as `-` rather than omitted: an absent key
+  // reads as an older build, not as good news.
+  assert.match(idle, /declined=1 why=- unclaimed=1 /)
   assert.match(idle, /breaker=closed trips=0 held=0$/)
   assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
 
@@ -763,6 +768,28 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
     applied: false,
   }
   assert.match(statusLine(team, 0), /reclaim=t1<bob reclaim-dry-run$/)
+
+  // The cumulative skip counters sit outside the signature on purpose — a task
+  // nobody takes bumps them every round. The *reason* stays inside it: a team
+  // that starts being blocked by write scopes, or stops being dispatchable
+  // because the last member just refused, is news an operator needs at once
+  // rather than at the next heartbeat.
+  team.skipKinds = ['scope']
+  const blockedByScope = statusLine(team, 0)
+  assert.match(blockedByScope, /why=scope /)
+  team.skippedScope = 99
+  assert.equal(
+    statusSignature(statusLine(team, 0)),
+    statusSignature(blockedByScope),
+    'a climbing skip counter is not a change',
+  )
+  team.skipKinds = ['declined', 'scope']
+  assert.match(statusLine(team, 0), /why=declined,scope /)
+  assert.notEqual(
+    statusSignature(statusLine(team, 0)),
+    statusSignature(blockedByScope),
+    'a new reason is a change',
+  )
 })
 
 if (failures.length > 0) {

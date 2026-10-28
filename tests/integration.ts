@@ -597,6 +597,36 @@ await test('a round whose only change was a skip counter writes no line', async 
   assert.equal(quiet.length, 1)
 })
 
+await test('a team blocked for a new reason writes a line, and then goes quiet again', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-why-'))
+  const file = join(dir, 'status.log')
+  const host = makeHost([task({ id: 'task-1' })], [member('alice', 'inactive')])
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, statusFile: file }
+  const round = async (): Promise<void> => {
+    await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  }
+
+  // Round one: one ready task, one idle member — dispatched, nothing skipped.
+  await round()
+  assert.match((await readFile(file, 'utf8')).trimEnd(), /why=- /)
+
+  // The member takes it and a second task arrives with nobody left to take it.
+  // The *reason* for skipping appears, which is news an operator wants now
+  // rather than at the next heartbeat.
+  host.tasks[0] = task({ id: 'task-1', status: 'in_progress', ownerName: 'alice' })
+  host.tasks.push(task({ id: 'task-2' }))
+  await round()
+  assert.match((await readFile(file, 'utf8')).trimEnd(), /why=noMember /)
+
+  // Round three skips for the same reason again: the totals move, the line
+  // would say what the previous one already said.
+  await round()
+  const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.equal(lines.length, 2)
+  assert.match(lines[1] ?? '', /why=noMember /)
+})
+
 /** One fake Lead per team, plus a host whose change-wait the test controls. */
 function makeLoopCtx(teams: number, options: { manual: boolean; intervalMs: number }) {
   const leads = Array.from({ length: teams }, (_, index) => ({ id: `lead-${index}` }))

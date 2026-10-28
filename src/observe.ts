@@ -97,7 +97,15 @@ export function statusLine(team: TeamState, at: number): string {
     `scope=${team.skippedScope}`,
     `noMember=${team.skippedNoMember}`,
     `declined=${team.skippedDeclined}`,
+    // Why this round skipped anything, deduplicated. `-` rather than omitting
+    // the field: "nothing was skipped" is a fact a reader needs, and an absent
+    // key is indistinguishable from an older build.
+    `why=${team.skipKinds.length === 0 ? '-' : team.skipKinds.join(',')}`,
     `unclaimed=${team.unclaimed}`,
+    // Wakes already sent whose post-cooldown check is still owed. One number,
+    // because `lastDispatch` can only remember the most recent hand-off —
+    // two wakes in flight look exactly like one without it.
+    `pending=${team.pendingWakes.size}`,
     `reclaimed=${team.reclaimed}`,
     `tasks=${team.tasks}`,
     `inFlight=${team.inFlight}`,

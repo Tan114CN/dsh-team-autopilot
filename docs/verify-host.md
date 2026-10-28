@@ -56,7 +56,7 @@ autopilot inactive
 totals rounds=0 dispatched=0 suppressed=0 skipped=0 unclaimed=0 reclaimed=0
 caller team=session-… tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (live)
 teams=1
-  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
+  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 pending=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
     lastReclaim none
     lastDispatch none
 ```
@@ -76,6 +76,7 @@ teams=1
 - 团队的**字段有变化**时立即写
 - **没有变化**时只在 `statusHeartbeatMs`（默认 10 分钟）到期时写一行心跳
 - **累计跳过计数不算变化**：`skip` / `scope` / `noMember` / `declined` 是累计值，任务一直没人接时它们每轮都在涨，若算作变化就等于逐轮写。`< 0.3.4` 正是栽在这里——只要团队里有被拒过一次的任务，日志就会退化回每 tick 一行
+- **但本轮原因 `why` 算**：计数不进比较，原因进。从 `why=-` 变成 `why=scope`，或变成 `why=declined`（全员拒接、插件就此停手），都会立即写一行，不必等心跳——这是「安静」和「瞎」的分界
 
 所以「文件里 10 分钟没有新行」是**按设计在工作**，不代表插件停了。要区分「安静」和「死了」，看有没有下一条心跳：
 
@@ -89,7 +90,7 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 一行长这样（字段与 status 工具同源，顺序固定）：
 
 ```
-2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 unclaimed=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
+2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 why=- unclaimed=0 pending=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
 ```
 
 读法：
@@ -100,8 +101,10 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 | 是不是刚重启过 | 出现新的 `autopilot-start`；团队行 `ticks=1`（内存态归零） |
 | 有效节拍对不对 | 两次心跳的 `ticks` 差 ÷ 秒数 ≈ `tickMs`。安静 10 分钟应新增约 20 个 tick（只多不少：真实变化会提前唤醒），**翻倍说明在跑 `<0.3.1`** |
 | 有没有派发 | `dispatched=`；配合 `unclaimed=` / `reclaimed=` |
-| 为什么没派 | `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 五个数合起来只有一个解释 |
-| 日志文件是哪份代码写的 | 团队行里没有 `blocked=`/`done=` → 版本低于 `0.3.2` |
+| 为什么没派 | `why=` 指出本轮原因（`scope` / `noMember` / `declined` / `-`），再用 `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 定位到具体任务 |
+| 有几条唤醒还在等判定 | `pending=`。`outcome=unchecked` 只反映**最后一条**唤醒，一轮派两个任务时另一个只能靠 `pending` 看出来 |
+| 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过 |
+| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2` |
 
 > 写入失败一律静默——观测是便利，满盘或只读 profile 不能卡住派发。所以文件不存在或某段没写，不能反推成「插件没跑」，要用 2.1 的状态工具交叉确认。
 

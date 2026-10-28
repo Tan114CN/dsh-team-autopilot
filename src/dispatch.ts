@@ -380,6 +380,11 @@ export async function tick(
     else if (entry.kind === 'declined') team.skippedDeclined += 1
     else team.skippedNoMember += 1
   }
+  // The counters above are cumulative, so they are kept out of the status
+  // signature on purpose. This is the round's own answer, and the only skip
+  // fact allowed to make a round newsworthy: it changes when the reason
+  // changes, not every time a task goes untaken.
+  team.skipKinds = [...new Set(blocked.map(entry => entry.kind))].sort()
   team.lastTickAt = Date.now()
   state.rounds += 1
 

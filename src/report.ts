@@ -36,6 +36,8 @@ export interface TeamReport {
   skippedDeclined: number
   /** Wakes still unowned at the next board read. */
   unclaimed: number
+  /** Wakes already sent whose post-cooldown check has not run yet. */
+  pending: number
   /** Circuit-breaker state for this team. */
   breaker: BreakerState
   /** Times this team's breaker tripped. */
@@ -144,7 +146,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
       `  team=${team.team} ticks=${team.ticks} dispatched=${team.dispatched} suppressed=${team.suppressed}`
       + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined})`
       + ` breaker=${team.breaker} trips=${team.breakerTrips} held=${team.breakerBlocked}`
-      + ` reclaimed=${team.reclaimed} unclaimed=${team.unclaimed}`
+      + ` reclaimed=${team.reclaimed} unclaimed=${team.unclaimed} pending=${team.pending}`
       + ` tasks=${team.tasks} inFlight=${team.inFlight} claimable=${team.claimable} blocked=${team.blocked} done=${team.done} idle=${team.idle} slots=${team.slots} (${age})`,
     )
     // The last two decisions, spelled out. A counter says "something happened

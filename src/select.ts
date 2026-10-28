@@ -9,6 +9,7 @@
  */
 
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
+import type { SkipKind } from './state.ts'
 
 /** One planned hand-off from a ready task to an idle teammate. */
 export interface DispatchPlan {
@@ -28,7 +29,7 @@ export interface BlockedTask {
    * "is this team blocked by write scopes, or simply out of members?" — two
    * problems with opposite fixes.
    */
-  readonly kind: 'scope' | 'noMember' | 'declined'
+  readonly kind: SkipKind
   /** Human-readable cause. */
   readonly reason: string
 }

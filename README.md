@@ -322,7 +322,7 @@ totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
 caller team=<id> tasks=N inFlight=N claimable=N idle=N slots=N (live)
 teams=N
   team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N)
-  breaker=<state> trips=N held=N reclaimed=N unclaimed=N
+  breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N
   tasks=N inFlight=N claimable=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
@@ -336,6 +336,8 @@ teams=N
 | `lastReclaim`（task / from / reason / 时刻） | 刚刚收回的是哪个任务、从谁手里、为什么 | 只有 `reclaimed=2` 时，判断「是不是同一个任务在循环」只能靠任务的 revision 数字往上爬来反推 |
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
+| `pending`（当前待判） | 现在有几条唤醒已发出、还没到判定时刻 | `lastDispatch` 只能记住一条；一轮唤醒两个任务时，第二个在 `outcome` 上完全看不见 |
+| `why`（`scope` / `noMember` / `declined` / `-`，**本轮**） | 这一轮为什么跳过 | 上面三个计数是累计的，任务没人接时每轮都在涨；`why` 只在原因变化时才变——所以它既安静又即时，「全员拒接、插件停手」这类事件不用等心跳 |
 
 `outcome` 的判定发生在**唤醒过了冷却窗口之后**，不是下一次读板就判：唤醒发出去的瞬间，成功与「没人接」在观测上完全相同，而成员读消息、调 `team_task_update` 需要时间。真机上变化驱动的轮次可能只隔 1 秒，那时判就等于在判成员的思考时间——曾因此把每一次唤醒都算成未认领、把正在认领的成员记进拒绝集合、把任务改派给同事造成重复劳动。冷却窗口是判定最早的合理时刻：任务在此之前本来也不允许改派给别人。
 
@@ -362,11 +364,11 @@ team-autopilot:
   statusFile: C:/Users/you/.dsh/profiles/desktop/team-autopilot.log
 ```
 
-只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记：
+只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记。累计跳过计数（`skip` / `scope` / `noMember` / `declined`）不参与比较——它们每轮都在涨，算作变化就等于逐轮写；本轮的原因 `why` 参与比较，所以「开始被写域挡住」「全员拒接后停手」仍会立刻写一行：
 
 ```
 2026-10-28T08:31:02.004Z autopilot-start version=0.3.2 tickMs=30000 wakeMs=60000 reclaimMs=60000 heartbeatMs=600000 dryRun=false
-2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 unclaimed=2 reclaimed=0 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
+2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 why=declined unclaimed=2 pending=0 reclaimed=0 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
 ```
 
 单行是刻意的：`tail -1` 是当前状态，`tail -30` 是最近历史，`grep -c` 数得出重复次数。多行美化版必须整份读完才有用，那对日志等于永远不会被读。
