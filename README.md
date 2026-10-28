@@ -192,8 +192,8 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 45 checks passed
-node tests/integration.ts                       # → OK — 24 integration checks passed
+node tests/verify.ts                            # → OK — 46 checks passed
+node tests/integration.ts                       # → OK — 26 integration checks passed
 node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
@@ -296,6 +296,28 @@ dsh web
 
 结论：**僵死回收在真实宿主上生效，语义为「回池」而非「换人」**，与 `@nanmicoder/dsh-agent-teams` 的 `reassign_task`（指定新 owner）方向相反。
 
+### 回收停派（2026-10-28 真机实证，0.3.7）
+
+这是 `0.3.6` 真机撞到、`0.3.7` 修复的循环的**反向验证**：用两个「认领后只停手不干活」的成员（`stall-a` / `stall-b`）让任务空转，观察它到线即停。
+
+桌面 profile，`reclaimAfterMs: 60000`、`reclaimRetryLimit: 3`（默认），`dryRun: false`：
+
+| 时刻 | 事件 | 字段 |
+|---|---|---|
+| `ticks=9` | 第 1 次回收 | `reclaim=task-1<stall-a` → 派给 `stall-b` |
+| `ticks=23` | 第 2 次回收 | `reclaim=task-1<stall-b` → 派回 `stall-a` |
+| `ticks=29` | **第 3 次回收 → 停派** | `parked=1`、`park=task-1<stall-a after=3`、`why=parked` |
+| `ticks=29` 之后 | **彻底安静** | `dispatched` 冻结在 2，无任何新行 |
+
+三圈 `stall-a → stall-b → stall-a` 的空转，到第 3 次回收戛然而止。逐项对上设计：
+
+- **停派只停派发、不动任务板**：停派那一刻任务仍是 `claimable=1`，`inFlight=0`——插件只是不再替它找人，Lead 或人类随时能接手。
+- **`reclaimed` 停在 3，没有第 4 次**：到线即停，不是加退避继续悄悄烧。
+- **停派后日志安静**：`dispatched` 冻结、无新行，正是「看得见地停下」而非「看不见地一直试」。
+- **判定没被「刚认领过」干扰**：第 3 次回收前 `stall-a` 又认领了一次（`wake=task-1>stall-a outcome=claimed`），但没再干活，停派照常触发。
+
+status 里逐条列出 `parked task=task-1 after=3 reclaims lastOwner=stall-a`，与日志 `park=task-1<stall-a after=3` 同词同值。
+
 ### 真机顺带发现的两条行为
 
 1. **成员 spawn 后立刻跑一个回合，并会主动扫任务板认领 ready 任务**——成员侧天然存在模型驱动派发。但它只在 spawn 首回合（或被唤醒时）发生；**新建任务本身不会触发任何成员**，与官方「Task readiness never starts an owner」一致。造僵死场景时必须先把多余成员冻结，否则任务会被吃掉。
@@ -307,7 +329,6 @@ dsh web
 - 与官方 `wait_agent` 工具共存是否互相干扰
 - 僵死回收的两个触发条件未实证：**owner 离开 roster**（官方 9 个工具没有移除成员的入口，只能靠进程退出或冷恢复失败，难人为制造）与 **owner `failed`**（中等难造）。已实证的是 `inactive` 超时这一条
 - 负向场景「`running` / `provisioning` 持有者不被回收」未在真机跑过（进程内断言全绿）
-- **回收停派（`parked`）未在真机跑过**：修的是真机撞到的循环（`session-7584e46c`，20 分钟 `reclaimed=12` / `dispatched=19` / `done=0`），但修完的版本只跑了进程内断言。要复现得让一个成员认领后持续不干活、且撑过 3 次 `reclaimAfterMs`（默认 60s）
 - 与 `@nanmicoder/dsh-agent-teams` 双调度器并行的实际后果（上面「不要同时装」是源码层推断，未在真机上跑过双装场景）
 
 ## 可观测性：status 字段怎么读

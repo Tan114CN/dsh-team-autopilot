@@ -20,6 +20,10 @@
 - README 的 status 字段表补 `parked` 一类（`reclaimed` 涨是**正确判定**的结果，看不出空转），「仍未验证」新增回收停派未跑真机一项。
 - 断言数订正：`verify` 45 → **46**、`integration` 24 → **26**。
 
+### 真机实证
+
+- **回收停派已在真实宿主上验证**（2026-10-28，桌面 0.2.1-rc.3，`reclaimAfterMs: 60000`、`reclaimRetryLimit: 3`，`dryRun: false`）。两个停手成员 `stall-a` / `stall-b` 让任务空转，`ticks=9/23/29` 三圈回收后 `park=task-1<stall-a after=3`、`why=parked`、`parked=1`，`reclaimed` 停在 3（没有第 4 次），`dispatched` 冻结在 2、停派后日志安静。任务停派时仍 `claimable=1`——只停派发、不动任务板。README「仍未验证」里该条移除，`docs/verify-reclaim.md` 已知限制第 2 条补实测值。
+
 ## [未发布]
 
 ### 文档
