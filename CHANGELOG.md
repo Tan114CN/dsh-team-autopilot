@@ -5,15 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.3.6] - 2026-10-28
+
+### 新增
+
+- **`team_autopilot_status` 新增 `why`：这一轮为什么没派出去**。`0.3.5` 只把它写进了日志行，所以读 status 的人看到的仍是三个**累计**计数——「全员拒接、插件就地停手」和「同一次拒接被数了六十遍」在数据上长得一模一样。现在两个面对同一件事用同一个词：日志行 `why=declined,scope`，status 里 `why: ["declined", "scope"]`（数组，空数组等于 `-`）。
+- **`toTeamReport()` 从 `index.ts` 移到 `report.ts`**。它是「状态桶 → 报告行」的纯映射，而 `why` 取自本轮原因集合、`pending` 取自唤醒记账表的长度——两者都无法从旁边的计数推出来，也只能在没有宿主的情况下才测得动。迁移后新增的断言直接覆盖这条映射，包括「返回的对象不与后续轮次就地修改的状态共享数组」。
 
 ### 文档
 
 - **README 与 `docs/` 全量对账**（`0.3.5` 发布后逐份核到代码），修正三类问题：样例输出与真实格式不一致、字段说明张冠李戴、版本前提与失效链接。三处最影响阅读的：
   - README 的 status 样例把**一整行**的团队行排成了三行，照它 `grep 'breaker=open'` 永远 grep 不到；`caller` 行还缺 `blocked=` / `done=`。
-  - `why` 被列进「status 字段」表，但它**只在日志行**里；而真正在 status 里的 `pending` 反倒漏了速查表。
+  - `why` 被列进「status 字段」表、实际上**只在日志行**里，而真正在 status 里的 `pending` 反倒漏了速查表——两处输出面的词汇表已经分叉。这个缺口这次直接补进代码（见上），文档改为如实描述两个面。
   - `docs/prompts-dispatch.md` 声称「`idle` 可能包含 Lead 自己」。`availableMembers()` 只取 `role === 'teammate' && status === 'inactive'`，**Lead 永远不在派发候选里**，`idle` 也不含它；连带「一个成员都没有时任务不会派出去」也写清楚（`noMember` 上涨）。
-- 断言数订正：`verify` 42 → **44**、`integration` 16 → **24**（README、`docs/distribution.md` 及各处的「有 21 项断言」「覆盖 4 条关键路径」同步改掉）。
+- 断言数订正：`verify` 42 → **45**、`integration` 16 → **24**（README、`docs/distribution.md` 及各处的「有 21 项断言」「覆盖 4 条关键路径」同步改掉）。
 - `docs/prompts-reclaim.md` 删掉整段「旧包迁移 + 手工把解包目录塞进 `node_modules`」的过时流程——改名与升级早已完成，手放的副本不进 `package.json` 与锁文件、下次 `pnpm install` 就被覆盖，现在改为版本前提 + 走包管理器的指引。
 - `docs/verify-host.md`：回滚段落原本让人 `cp *.bak-20261027-233651`，那批备份已清理，且锁文件备份本身可能正是问题源头；改为 `pnpm add dsh-team-autopilot@<版本>`，并补「只想停掉插件就把 `enabled` 设 false」。另补一句：一旦离开首次安全模式，`first-run dryRun === true` 这一项**会一直 FAIL**，属预期不是故障。
 - `docs/verify-multiteam.md` 去掉「验证 `0.1.2` 修复」的一次性框架，改为可反复执行的回归手册（回归触发点写明：改动主循环或 Lead 解析时重跑）。

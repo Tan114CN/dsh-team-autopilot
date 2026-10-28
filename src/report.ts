@@ -14,7 +14,7 @@
  */
 
 import type { BreakerState } from './breaker.ts'
-import type { DispatchRecord, ReclaimRecord } from './state.ts'
+import type { DispatchRecord, ReclaimRecord, SkipKind, TeamState } from './state.ts'
 
 /** One team's counters and the board as of its last observation. */
 export interface TeamReport {
@@ -34,6 +34,17 @@ export interface TeamReport {
   skippedNoMember: number
   /** Skips caused by every idle teammate having already declined the task. */
   skippedDeclined: number
+  /**
+   * Why the team's *last* round skipped tasks, deduplicated and sorted.
+   *
+   * The three counters above are lifetime totals: they answer "has this ever
+   * happened", never "why is nothing moving now". A task nobody takes bumps
+   * them every round whether or not the reason is new, so a reader watching
+   * `declined` climb cannot tell a fresh refusal from the same one counted
+   * sixty times. This set is that round's own answer. Empty means the round
+   * skipped nothing.
+   */
+  why: SkipKind[]
   /** Wakes still unowned at the next board read. */
   unclaimed: number
   /** Wakes already sent whose post-cooldown check has not run yet. */
@@ -86,6 +97,47 @@ export interface LiveBoard {
   idle: number
   /** Free concurrency slots right now. */
   slots: number
+}
+
+/**
+ * Convert one team's state bucket into its report row.
+ *
+ * Lives here rather than next to the tool because it is a pure mapping and the
+ * mapping is the part that goes wrong quietly: `why` comes from the last
+ * round's reason set, `pending` from the size of the wake bookkeeping map, and
+ * neither is derivable from the counters beside them. Keeping it in this module
+ * lets the mapping be asserted with no host at all.
+ * @param team - the team's state bucket.
+ * @returns the row describing it.
+ */
+export function toTeamReport(team: TeamState): TeamReport {
+  return {
+    team: team.team,
+    ticks: team.ticks,
+    dispatched: team.dispatched,
+    suppressed: team.suppressed,
+    skipped: team.skipped,
+    skippedScope: team.skippedScope,
+    skippedNoMember: team.skippedNoMember,
+    skippedDeclined: team.skippedDeclined,
+    why: [...team.skipKinds],
+    unclaimed: team.unclaimed,
+    pending: team.pendingWakes.size,
+    breaker: team.breaker,
+    breakerTrips: team.breakerTrips,
+    breakerBlocked: team.breakerBlocked,
+    reclaimed: team.reclaimed,
+    tasks: team.tasks,
+    inFlight: team.inFlight,
+    claimable: team.claimable,
+    blocked: team.blocked,
+    done: team.done,
+    idle: team.idle,
+    slots: team.slots,
+    ...team.lastTickAt === undefined ? {} : { lastTickAt: team.lastTickAt },
+    ...team.lastReclaim === undefined ? {} : { lastReclaim: team.lastReclaim },
+    ...team.lastDispatch === undefined ? {} : { lastDispatch: team.lastDispatch },
+  }
 }
 
 /**
@@ -145,6 +197,9 @@ export function renderReport(report: StatusReport, now: number): string[] {
     lines.push(
       `  team=${team.team} ticks=${team.ticks} dispatched=${team.dispatched} suppressed=${team.suppressed}`
       + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined})`
+      // Same word, same `-` for "nothing", so a reader who learned the log line
+      // can read this one: the counters are lifetime, `why` is the last round.
+      + ` why=${team.why.length === 0 ? '-' : team.why.join(',')}`
       + ` breaker=${team.breaker} trips=${team.breakerTrips} held=${team.breakerBlocked}`
       + ` reclaimed=${team.reclaimed} unclaimed=${team.unclaimed} pending=${team.pending}`
       + ` tasks=${team.tasks} inFlight=${team.inFlight} claimable=${team.claimable} blocked=${team.blocked} done=${team.done} idle=${team.idle} slots=${team.slots} (${age})`,

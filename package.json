@@ -1,6 +1,6 @@
 {
   "name": "dsh-team-autopilot",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Deterministic auto-dispatch for native DeepSeek Harness Agent Teams: wakes idle members when a task becomes ready, and turns advisory write scopes into an effective soft lock.",
   "keywords": [
     "dsh",

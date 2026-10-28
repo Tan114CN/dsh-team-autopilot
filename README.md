@@ -189,7 +189,7 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 44 checks passed
+node tests/verify.ts                            # → OK — 45 checks passed
 node tests/integration.ts                       # → OK — 24 integration checks passed
 node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
@@ -201,7 +201,7 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
-- **零依赖自检**：`tests/verify.ts` 的 44 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
+- **零依赖自检**：`tests/verify.ts` 的 45 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
 - **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，24 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
 ## 开发环境注意事项
@@ -315,7 +315,7 @@ autopilot active
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
 caller team=<id> tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (live)
 teams=N
-  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N) breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
+  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N) why=<a,b|-> breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
@@ -331,7 +331,7 @@ teams=N
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
 | `pending`（当前待判） | 现在有几条唤醒已发出、还没到判定时刻 | `lastDispatch` 只能记住一条；一轮唤醒两个任务时，第二个在 `outcome` 上完全看不见 |
-| `why`（`scope` / `noMember` / `declined` / `-`，**本轮**）| 这一轮为什么跳过 | **只在日志行里**（status 工具没有这个字段，它的 `skipped (scope=…)` 是累计值）。它只在原因变化时才变，所以既安静又即时——「全员拒接、插件停手」这类事件不用等心跳 |
+| `why`（`scope` / `noMember` / `declined`，**本轮**，无跳过时 `-`）| 这一轮为什么跳过 | 前面括号里那三个是**累计**值，任务一直没人接就每轮都涨，回答不了「此刻为什么不动」。`why` 是这一轮的答案，只在原因变化时才变，所以既安静又即时——「全员拒接、插件停手」不用等心跳。日志行与 status 用同一个词，status 里是数组（`["declined","scope"]`，空数组即 `-`） |
 
 `outcome` 的判定发生在**唤醒过了冷却窗口之后**，不是下一次读板就判：唤醒发出去的瞬间，成功与「没人接」在观测上完全相同，而成员读消息、调 `team_task_update` 需要时间。真机上变化驱动的轮次可能只隔 1 秒，那时判就等于在判成员的思考时间——曾因此把每一次唤醒都算成未认领、把正在认领的成员记进拒绝集合、把任务改派给同事造成重复劳动。冷却窗口是判定最早的合理时刻：任务在此之前本来也不允许改派给别人。
 

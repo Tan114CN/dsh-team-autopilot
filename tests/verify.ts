@@ -28,6 +28,7 @@ import type { BreakerConfig } from '../src/breaker.ts'
 import { findLeads } from '../src/lead.ts'
 import { boardSummary } from '../src/select.ts'
 import { renderReport } from '../src/report.ts'
+import { toTeamReport } from '../src/report.ts'
 import type { StatusReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { planReclaim } from '../src/reclaim.ts'
@@ -543,6 +544,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         skippedScope: 0,
         skippedNoMember: 0,
         skippedDeclined: 0,
+        why: [],
         unclaimed: 0,
         pending: 0,
         breaker: 'closed',
@@ -582,6 +584,10 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
   // build that never learned to report the field at all.
   assert.match(text, /lastReclaim none/)
   assert.match(text, /lastDispatch none/)
+  // The same `why=` the log line carries, and the same `-` for "no skip":
+  // status used to report only the lifetime counters here, which cannot say
+  // why nothing moved in the round they were just read after.
+  assert.match(text, /why=- /)
 })
 
 test('renderReport names the last reclaim and dispatch instead of only counting them', () => {
@@ -604,6 +610,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         skippedScope: 1,
         skippedNoMember: 0,
         skippedDeclined: 0,
+        why: ['scope'],
         unclaimed: 2,
         pending: 1,
         breaker: 'closed',
@@ -639,6 +646,9 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   const text = renderReport(report, 3_000).join('\n')
   // The skip total is broken down, so the two opposite fixes are told apart.
   assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0\)/)
+  // The breakdown says where the total came from; `why` says what the last
+  // round ran into. Both, because they answer different questions.
+  assert.match(text, /why=scope /)
   // Which task came back, from whom, and why — not just "reclaimed=2".
   assert.match(text, /lastReclaim task=task-3 from=worker-a reason='owner "worker-a" inactive for 60012ms' applied \(500ms ago\)/)
   // Which task went to whom, how many times, and whether it was picked up.
@@ -720,6 +730,26 @@ test('never reclaims from a running owner or from the Lead', () => {
   })
   assert.equal(result.releases.length, 0)
   assert.equal(result.stalled.size, 0)
+})
+
+test('the status row reads why and pending from the round, not from the counters', () => {
+  const team = teamState(createAutopilotState(), 'team-a')
+  // A team that has been skipping for a long time: the counters are high, but
+  // they say nothing about what the *last* round ran into.
+  team.skipped = 40
+  team.skippedDeclined = 40
+  team.skipKinds = ['declined']
+  team.pendingWakes.set('t1', { memberName: 'alice', at: 0 })
+  team.pendingWakes.set('t2', { memberName: 'alice', at: 0 })
+
+  const row = toTeamReport(team)
+  assert.deepEqual(row.why, ['declined'], 'why is the last round, not the lifetime total')
+  assert.equal(row.pending, 2, 'pending is the number of wakes awaiting judgement')
+
+  // A copy: the tool returns this object to the host, and the next round
+  // mutates the state's own array in place.
+  team.skipKinds.push('scope')
+  assert.deepEqual(row.why, ['declined'], 'the reported row must not alias live state')
 })
 
 test('statusLine stays one greppable line and grows as decisions happen', () => {

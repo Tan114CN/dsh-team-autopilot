@@ -106,7 +106,7 @@ awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
 | 为什么没派 | `why=` 指出本轮原因（`scope` / `noMember` / `declined` / `-`），再用 `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 定位到具体任务 |
 | 有几条唤醒还在等判定 | `pending=`。`outcome=unchecked` 只反映**最后一条**唤醒，一轮派两个任务时另一个只能靠 `pending` 看出来 |
 | 插件是不是已经停手 | `why=declined` + `dispatched=` 不再增长 → 所有空闲成员都拒过 |
-| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2` |
+| 日志文件是哪份代码写的 | 团队行里没有 `why=`/`pending=` → 版本低于 `0.3.5`；没有 `blocked=`/`done=` → 低于 `0.3.2`；status 的团队对象里没有 `why` → 低于 `0.3.6` |
 
 > 写入失败一律静默——观测是便利，满盘或只读 profile 不能卡住派发。所以文件不存在或某段没写，不能反推成「插件没跑」，要用 2.1 的状态工具交叉确认。
 
@@ -242,4 +242,4 @@ node ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.cjs \
 | `breakerTrips` | 熔断打开次数 |
 | `breakerBlocked` | 因熔断而跳过的轮/任务数 |
 | `lastError` | 最近一次错误文本 |
-| `why` | **只在日志行里，status 没有这个字段**。本轮跳过原因的集合（`scope` / `noMember` / `declined`，无跳过时 `-`），去重排序；只在原因变化时才写行，所以「全员拒接、插件停手」会立刻落一行而不用等心跳 |
+| `why` | 本轮跳过原因的集合（`scope` / `noMember` / `declined`，无跳过时 `-`），去重排序。日志行与 status 同词；status 里是**数组**（`["declined","scope"]`，空数组等于 `-`）。前面那些 `skipped*` 是累计值，只有 `why` 回答「此刻为什么不动」；它只在原因变化时才变，所以「全员拒接、插件停手」会立刻落一行而不用等心跳 |

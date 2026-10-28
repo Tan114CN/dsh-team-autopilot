@@ -164,6 +164,7 @@ const warm = {
     skippedScope: 0,
     skippedNoMember: 0,
     skippedDeclined: 0,
+    why: ['scope'],
     unclaimed: 1,
     pending: 1,
     breaker: 'closed',
@@ -200,6 +201,18 @@ assert.deepEqual(warmProblems, [], `nested decision records must validate: ${war
 const warmText = definition.output.render({}, warm).map(b => b.text ?? '').join('\n')
 assert.match(warmText, /lastReclaim task=task-1 from=worker-x reason='owner "worker-x" inactive for 60012ms' applied/)
 assert.match(warmText, /lastDispatch task=task-1 to=worker-x wakes=2 sent outcome=unclaimed/)
+// `why` is the one status field declared as an array. Assert it is enforced as
+// one: a string would pass a check that only looked at presence.
+assert.match(warmText, /why=scope /)
+const stringWhy = {
+  ...warm,
+  teams: [{ ...warm.teams[0], why: 'scope' }],
+}
+assert.notDeepEqual(
+  validateJsonSchemaValue(definition.output.schema, stringWhy, ''),
+  [],
+  'why is a set of reasons, not a comma-joined string',
+)
 
 console.log('PASS  status tool registers, validates, and renders')
 console.log('--- rendered output ---')

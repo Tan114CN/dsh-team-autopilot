@@ -19,10 +19,10 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { loop } from './dispatch.ts'
 import { createAutopilotState } from './state.ts'
-import type { AutopilotState, TeamState } from './state.ts'
+import type { AutopilotState } from './state.ts'
 import { boardSummary } from './select.ts'
 import { resolveBudget } from './breaker.ts'
-import { renderReport } from './report.ts'
+import { renderReport, toTeamReport } from './report.ts'
 import type { LiveBoard, StatusReport, TeamReport } from './report.ts'
 
 /** Cordis plugin name. */
@@ -129,6 +129,7 @@ const TEAM_SCHEMA = {
     skippedScope: { type: 'integer', required: true },
     skippedNoMember: { type: 'integer', required: true },
     skippedDeclined: { type: 'integer', required: true },
+    why: { type: 'array', items: { type: 'string' }, required: true },
     unclaimed: { type: 'integer', required: true },
     pending: { type: 'integer', required: true },
     breaker: { type: 'string', required: true },
@@ -182,40 +183,6 @@ const STATUS_SCHEMA = {
     lastError: { type: 'string' },
   },
 } as const
-
-/**
- * Convert one team's state bucket into its report row.
- * @param team - the team's state bucket.
- * @returns the row describing it.
- */
-function teamReport(team: TeamState): TeamReport {
-  return {
-    team: team.team,
-    ticks: team.ticks,
-    dispatched: team.dispatched,
-    suppressed: team.suppressed,
-    skipped: team.skipped,
-    skippedScope: team.skippedScope,
-    skippedNoMember: team.skippedNoMember,
-    skippedDeclined: team.skippedDeclined,
-    unclaimed: team.unclaimed,
-    pending: team.pendingWakes.size,
-    breaker: team.breaker,
-    breakerTrips: team.breakerTrips,
-    breakerBlocked: team.breakerBlocked,
-    reclaimed: team.reclaimed,
-    tasks: team.tasks,
-    inFlight: team.inFlight,
-    claimable: team.claimable,
-    blocked: team.blocked,
-    done: team.done,
-    idle: team.idle,
-    slots: team.slots,
-    ...team.lastTickAt === undefined ? {} : { lastTickAt: team.lastTickAt },
-    ...team.lastReclaim === undefined ? {} : { lastReclaim: team.lastReclaim },
-    ...team.lastDispatch === undefined ? {} : { lastDispatch: team.lastDispatch },
-  }
-}
 
 /**
  * Read the calling agent's own team board live.
@@ -290,7 +257,7 @@ export function apply(ctx: Context, config: Config = {}): void {
    * @returns the report.
    */
   const buildReport = (agent: unknown): StatusReport => {
-    const teams = [...state.teams.values()].map(teamReport)
+    const teams = [...state.teams.values()].map(toTeamReport)
     const dispatched = teams.reduce((sum, team) => sum + team.dispatched, 0)
     const suppressed = teams.reduce((sum, team) => sum + team.suppressed, 0)
     const skipped = teams.reduce((sum, team) => sum + team.skipped, 0)
