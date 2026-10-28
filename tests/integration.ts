@@ -576,6 +576,27 @@ await test('writes nothing when a round changed nothing, and rewrites on the hea
   assert.match(beaten[1] ?? '', /ticks=4/)
 })
 
+await test('a round whose only change was a skip counter writes no line', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-skipquiet-'))
+  const file = join(dir, 'status.log')
+  // One ready task and nobody to take it: every round skips it for the same
+  // reason, so the cumulative `skip`/`noMember` totals climb while the board
+  // itself stands still. That is a stuck team, and it is precisely the team
+  // whose log a reader wants to scan rather than watch scroll.
+  const host = makeHost([task({ id: 'task-1' })], [member('lead', 'running', 'lead')])
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, statusFile: file }
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+
+  const quiet = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  // The totals really did move — they are still in the line — but a growing
+  // total is not news, so only the first round was worth writing down.
+  assert.match(quiet[0] ?? '', /skip=1 scope=0 noMember=1/)
+  assert.equal(quiet.length, 1)
+})
+
 /** One fake Lead per team, plus a host whose change-wait the test controls. */
 function makeLoopCtx(teams: number, options: { manual: boolean; intervalMs: number }) {
   const leads = Array.from({ length: teams }, (_, index) => ({ id: `lead-${index}` }))

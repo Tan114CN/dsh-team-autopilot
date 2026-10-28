@@ -172,7 +172,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
     } else {
       const dispatch = team.lastDispatch
       const outcome = dispatch.claimed === undefined
-        ? 'not-checked-yet'
+        ? 'unchecked'
         : dispatch.claimed ? 'claimed' : 'unclaimed'
       lines.push(
         `    lastDispatch task=${dispatch.taskId} to=${dispatch.memberName}`

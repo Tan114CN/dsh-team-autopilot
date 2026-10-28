@@ -139,7 +139,16 @@ export function statusLine(team: TeamState, at: number): string {
  * @returns the line with its timestamp and tick count removed.
  */
 export function statusSignature(line: string): string {
-  return line.replace(/^\S+ /, '').replace(/\sticks=\d+/, '')
+  return line
+    .replace(/^\S+ /, '')
+    .replace(/\sticks=\d+/, '')
+    // The skip counters are cumulative, so a task that nobody can take bumps
+    // them on every round all by itself. Counting them as a change would make
+    // the signature differ forever on exactly the board that most needs a
+    // quiet log — one whose work is stuck — and quietly turn the heartbeat
+    // back into a per-tick write. The totals stay in the line for whoever
+    // reads it; they just do not make a round newsworthy on their own.
+    .replace(/\s(?:skip|scope|noMember|declined)=\d+/g, '')
 }
 
 /**
