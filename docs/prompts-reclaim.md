@@ -30,7 +30,7 @@ C:/Users/Tan11/.dsh/profiles/desktop/cordis.patch.yml
 
 ### 升级到新包
 
-npm 上新名尚未发布，走本地打包手工放置（不跑包管理器，避免污染 profile 的 pnpm 布局）：
+`dsh-team-autopilot@0.2.0` 已发布到 npm。但仍建议手工放置，不跑包管理器（避免污染 profile 的 pnpm 布局，也避开 `minimumReleaseAge` 对新版本的拦截）：
 
 ```bash
 # 0. 备份
@@ -38,17 +38,21 @@ cd /c/Users/Tan11/.dsh/profiles/desktop
 cp package.json package.json.bak-reclaim
 cp cordis.patch.yml cordis.patch.yml.bak-reclaim
 
-# 1. 打包（--ignore-scripts：dist 已是最新构建，且 prepack 依赖 PATH 里的 node）
-cd "E:/Workbuddy Project/dsh-team-scheduler"
-npm pack --ignore-scripts        # → dsh-team-autopilot-0.1.2.tgz
+# 1. 从 registry 拉已发布的包（--registry 必须显式指定：默认走 npmmirror 镜像）
+cd /c/Users/Tan11/AppData/Local/Temp && mkdir -p autopilot && cd autopilot
+npm pack dsh-team-autopilot@0.2.0 --registry=https://registry.npmjs.org
+tar -xzf dsh-team-autopilot-0.2.0.tgz
 
 # 2. 放进 profile（nodeLinker: hoisted，node_modules 就是普通目录）
-mkdir -p /tmp/autopilot && tar -xzf dsh-team-autopilot-0.1.2.tgz -C /tmp/autopilot
-mv /tmp/autopilot/package /c/Users/Tan11/.dsh/profiles/desktop/node_modules/dsh-team-autopilot
+cd /c/Users/Tan11/.dsh/profiles/desktop/node_modules
+mv dsh-team-autopilot dsh-team-autopilot.old-0.1.2      # 留着回滚
+cp -r /c/Users/Tan11/AppData/Local/Temp/autopilot/package dsh-team-autopilot
 
 # 3. 自检（不需要重启）
-npm run verify:mount
+cd "E:/Workbuddy Project/dsh-team-scheduler" && npm run verify:mount
 ```
+
+同时 profile 的 `package.json` 依赖要写成 `^0.2.0`，`pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 要列 `dsh-team-autopilot@0.2.0`（否则以后跑 pnpm install 会被「发布太新」拦住）。
 
 旧目录 `node_modules/dsh-team-scheduler` **先留着**，等验证通过再清。
 
