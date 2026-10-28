@@ -170,7 +170,7 @@ export function statusSignature(line: string): string {
     // quiet log — one whose work is stuck — and quietly turn the heartbeat
     // back into a per-tick write. The totals stay in the line for whoever
     // reads it; they just do not make a round newsworthy on their own.
-    .replace(/\s(?:skip|scope|noMember|declined|parked)=\d+/g, '')
+    .replace(/\s(?:skip|scope|noMember|declined|parked|suppressed|held)=\d+/g, '')
 }
 
 /**

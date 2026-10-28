@@ -877,6 +877,19 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   // event line stops claiming it, instead of outliving the condition.
   team.parked.clear()
   assert.equal(statusLine(team, 0).includes('park='), false, 'an unparked task is not announced')
+
+  // `suppressed` (cooldown) and `held` (breaker-open) climb every round while
+  // their condition holds, so like the skip counters they sit outside the
+  // signature — otherwise a breaker that stays open would turn the heartbeat
+  // back into a per-tick write. The `breaker=open` field is already inside it.
+  const beforeClimb = statusLine(team, 0)
+  team.suppressed = 7
+  team.breakerBlocked = 5
+  assert.equal(
+    statusSignature(statusLine(team, 0)),
+    statusSignature(beforeClimb),
+    'a climbing suppressed/held counter is not a change',
+  )
 })
 
 if (failures.length > 0) {

@@ -206,7 +206,7 @@ await test('trips the circuit breaker after consecutive send failures', async ()
   assert.ok(teamOf(state).breakerBlocked >= 1, 'the open breaker must have blocked a round')
 })
 
-await test('logs a blocked round instead of going quiet when the breaker is open', async () => {
+await test('logs the breaker opening, then goes quiet while it stays open', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'autopilot-breaker-'))
   const file = join(dir, 'status.log')
   const host = makeHost(
@@ -221,13 +221,20 @@ await test('logs a blocked round instead of going quiet when the breaker is open
   breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
   assert.equal(breaker.state, 'open')
 
-  // The round that the breaker blocks returns early — it must still log, or
-  // the file falls silent at the exact moment the team is stuck.
+  // The trip to open is an event, carried by `breaker=open` itself, so it is
+  // written. The `held` counter climbing while the breaker stays open is
+  // cumulative — it must not turn the heartbeat back into a per-tick write.
+  const linesAfterOpen = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.equal(linesAfterOpen.length, 1, 'the breaker trip did not log')
+  assert.match(linesAfterOpen[0] ?? '', /breaker=open/)
+
+  breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
   breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
   const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
-  assert.equal(lines.length, 2)
-  assert.match(lines[1] ?? '', /breaker=open/)
-  assert.match(lines[1] ?? '', /held=1/)
+  assert.equal(lines.length, 1, 'a held counter climbing every round re-opened the log')
+  // The single line is still the breaker-trip line; the later rounds that only
+  // bumped `held` did not add a line.
+  assert.match(lines[0] ?? '', /breaker=open trips=1 held=0$/)
 })
 
 await test('honours the per-team budget keyed by TeamId', async () => {
@@ -763,6 +770,11 @@ await test('ticks each team once per interval, not once per team per round', asy
       `${team.team} ticked ${team.ticks}x in ${expected} intervals`,
     )
   }
+  // `rounds` counts dispatch rounds (ticks), not loop iterations: one loop pass
+  // serves several teams, so counting there would inflate the total with the
+  // number of live teams. It must equal the sum of per-team ticks.
+  const tickSum = [...state.teams.values()].reduce((sum, team) => sum + team.ticks, 0)
+  assert.equal(state.rounds, tickSum, 'rounds drifted from the tick total')
 })
 
 await test('serves only the team whose change-wait fired', async () => {

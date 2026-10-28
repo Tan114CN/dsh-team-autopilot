@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.9] - 2026-10-28
+
+### 修复
+
+- **`rounds` 不再双计。** `state.rounds` 的语义是「跨所有团队的派发轮次」，但它在 `tick` 内（每团队一次）和 `loop` 迭代内（每次循环一次）各 `+1`，多团队时一轮循环会 tick N 个团队、再 +1，导致 `totals rounds=` 虚高且随团队数漂移。现在只保留 `tick` 内计数——`rounds` 等于各团队 `ticks` 之和，loop 空转或一轮服务多团队都不再额外 +1。
+- **熔断退避按团队，不再被健康团队清零。** `teamFailures` 之前只写不读，退避用的是全局 `failures`，而任意团队成功都会把它归零——持续失败的团队退避恒为 2s，健康团队还会掩盖另一个团队的连败。现在 `tick` 失败的退避改用该团队自己的 `teamFailures` 计数，`failures` 只留给 change-wait 失败的宿主级退避。
+- **`suppressed` / `held` 从日志签名剥离。** 熔断打开期间 `held`（`breakerBlocked`）逐轮 +1、冷却期内 `suppressed` 逐轮 +1，都会让签名每轮变化 → 每 tick 一行，把心跳退化回逐轮写。「熔断打开」这个事件已由 `breaker=open` 字段本身承载（它仍在签名内），后续的 `held` 累计增长是纯计数，不该重新打开日志。
+
+### 测试
+
+- `integration` 里「熔断打开写日志」的断言收紧：验证的是「closed→open 那一轮写一行（`breaker=open`），之后 `held` 累计增长保持安静」——旧的断言把「熔断打开」和「held 逐轮写」混在了一起。
+- 补断言：`rounds === 各团队 ticks 之和`；`suppressed`/`held` 累计增长不改变签名。
+
 ## [0.3.8] - 2026-10-28
 
 ### 修复

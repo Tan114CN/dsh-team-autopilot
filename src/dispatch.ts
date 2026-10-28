@@ -705,7 +705,11 @@ export async function loop(
       if (signal.aborted) return
     }
     lastRoundAt = Date.now()
-    state.rounds += 1
+    // `rounds` counts *dispatch* rounds, which are the `tick`s below — not
+    // this loop iteration. One loop pass can serve several teams (several
+    // ticks) or none at all (an empty edge), so counting here would inflate
+    // the total with the number of live teams and with idle spins. It is
+    // counted once per tick in `tick`.
 
     // Serve the teams that actually woke this round. The status line reports
     // one tick per team per interval; waking every team on every wake is what
@@ -732,10 +736,13 @@ export async function loop(
       } catch (error: unknown) {
         if (signal.aborted) return
         state.lastError = describe(error)
+        // Back off per *team*, not globally. A team that keeps failing should
+        // back off on its own schedule; using the shared `failures` here meant
+        // one healthy team's success reset the back-off for a team that was
+        // still failing, so the failing team never got past a 2s pause.
         const teamFail = (teamFailures.get(teamKey) ?? 0) + 1
         teamFailures.set(teamKey, teamFail)
-        failures += 1
-        await pause(backoffMs(failures), signal)
+        await pause(backoffMs(teamFail), signal)
         if (signal.aborted) return
         continue
       }
