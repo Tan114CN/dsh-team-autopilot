@@ -54,19 +54,57 @@ bundle 的组合只在 App 启动时进行，**关窗口 ≠ 退出**。
 ```
 autopilot inactive
 totals rounds=0 dispatched=0 suppressed=0 skipped=0 unclaimed=0 reclaimed=0
-caller team=session-… tasks=3 inFlight=1 claimable=1 idle=1 slots=1 (live)
+caller team=session-… tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (live)
 teams=1
-  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0)
-  breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0
-  tasks=3 inFlight=1 claimable=1 idle=1 slots=1 (726ms ago)
+  team=session-… ticks=3 dispatched=0 suppressed=0 skipped=0 (scope=0 noMember=0 declined=0) breaker=closed trips=0 held=0 reclaimed=0 unclaimed=0 tasks=3 inFlight=1 claimable=1 blocked=1 done=0 idle=1 slots=1 (726ms ago)
+    lastReclaim none
+    lastDispatch none
 ```
 
 - `inactive` 是因为 `dryRun: true`（`enabled` 仍为 `true`），**但计数会随轮次增长**，这是正常的。
 - `caller` 一行是**调用方自己团队**的实时板（live），`team=` 那行是 autopilot 上次 tick 的快照并带年龄——两者数值不一致是正常的。
-- `skipped` 后面的 `(scope / noMember)` 是跳过原因拆分：写域冲突 vs 没有空闲成员。
-- 若模型说"没有这个工具" → 插件未加载，跳到 2.3。
+- `skipped` 后面的 `(scope / noMember / declined)` 是跳过原因拆分：写域冲突 / 没有空闲成员 / 空闲成员全都拒绝过这个任务。
+- `tasks` 是**四分桶，恒等于总数**：`inFlight + claimable + blocked + done == tasks`。`blocked` 是卡在依赖上的（`pending` 未 `ready` 且无 owner），`done` 是 `completed`/`deleted`。所以「4 个任务、0 可派、2 个空闲」能立刻区分出是卡依赖还是活已干完。
+- `lastReclaim none` / `lastDispatch none` 是**「还没发生过」**，不是字段缺失。空行与「这版不会报这个字段」在读的人眼里一样，所以显式打 `none`。
+- 若模型说"没有这个工具" → 插件未加载，跳到 2.4。
 
-### 2.2 日志出现本插件
+### 2.2 状态日志文件（`statusFile`）——安静是正常的
+
+`cordis.patch.yml` 里设了 `statusFile` 时，插件会往该文件追加状态行。**关键在于它不是每 tick 一行**：
+
+- 每次**进程启动**写一行 `autopilot-start`，带版本号和生效配置
+- 团队的**字段有变化**时立即写
+- **没有变化**时只在 `statusHeartbeatMs`（默认 10 分钟）到期时写一行心跳
+
+所以「文件里 10 分钟没有新行」是**按设计在工作**，不代表插件停了。要区分「安静」和「死了」，看有没有下一条心跳：
+
+```bash
+f=~/.dsh/team-autopilot.log
+tail -1 "$f"                              # 当前状态
+grep autopilot-start "$f" | tail -1       # 最近一次启动的版本与配置
+awk '$1 >= "2026-10-28T08:52"' "$f"       # 某次重启之后的全部行
+```
+
+一行长这样（字段与 status 工具同源，顺序固定）：
+
+```
+2026-10-28T08:52:57.086Z team=session-… ticks=1 dispatched=0 suppressed=0 skip=0 scope=0 noMember=0 declined=0 unclaimed=0 reclaimed=0 tasks=0 inFlight=0 claimable=0 blocked=0 done=0 idle=0 slots=2 breaker=closed trips=0 held=0
+```
+
+读法：
+
+| 想知道 | 看哪里 |
+|---|---|
+| 当前版本、配置有没有生效 | `grep autopilot-start`，`version=` / `tickMs=` / `heartbeatMs=` |
+| 是不是刚重启过 | 出现新的 `autopilot-start`；团队行 `ticks=1`（内存态归零） |
+| 有效节拍对不对 | 两次心跳的 `ticks` 差 ÷ 秒数 ≈ `tickMs`。安静 10 分钟应新增约 20 个 tick（只多不少：真实变化会提前唤醒），**翻倍说明在跑 `<0.3.1`** |
+| 有没有派发 | `dispatched=`；配合 `unclaimed=` / `reclaimed=` |
+| 为什么没派 | `claimable=`/`blocked=`/`done=`/`idle=`/`slots=` 五个数合起来只有一个解释 |
+| 日志文件是哪份代码写的 | 团队行里没有 `blocked=`/`done=` → 版本低于 `0.3.2` |
+
+> 写入失败一律静默——观测是便利，满盘或只读 profile 不能卡住派发。所以文件不存在或某段没写，不能反推成「插件没跑」，要用 2.1 的状态工具交叉确认。
+
+### 2.3 日志出现本插件
 
 ```bash
 ls -t ~/.dsh/profiles/desktop/.plugin-manager/logs/operation-* | head -1
@@ -76,7 +114,7 @@ grep -ri "team-autopilot" ~/.dsh/profiles/desktop/.plugin-manager/logs | tail -2
 
 成功时至少能看到 bundle 被组合、`team-autopilot` 被 insert 的痕迹。
 
-### 2.3 加载失败排查表（按报错对号入座）
+### 2.4 加载失败排查表（按报错对号入座）
 
 | 现象（日志关键字） | 原因 | 处理 |
 |---|---|---|
@@ -173,12 +211,16 @@ rm -rf node_modules/dsh-team-autopilot
 
 | 字段 | 含义 |
 |---|---|
-| `rounds` | 已执行的派发轮数 |
+| `rounds` | 已执行的派发轮数（全局；一轮可以只服务一个团队） |
+| `ticks` | 该团队被 tick 的次数。**每团队每 interval 只涨 1**；涨得比「秒数 ÷ `tickMs`」快 = 版本低于 `0.3.1` |
 | `dispatched` | 成功派发次数（dryRun 下也会计数） |
 | `suppressed` | 被冷却窗口抑制的次数 |
-| `skipped` | 被跳过的任务数（累计），后面括号里拆成 `scope`（写域冲突）与 `noMember`（无空闲成员） |
+| `skipped` | 被跳过的任务数（累计），括号里拆成 `scope`（写域冲突）/ `noMember`（无空闲成员）/ `declined`（空闲成员全都拒绝过这个任务） |
 | `unclaimed` | 唤醒后下一次读板时仍无主的次数；持续上涨 = 有成员从不接活 |
-| `lastReclaim` / `lastDispatch` | 最近一次回收 / 派发的详情（哪个任务、从谁到谁、叫了几次、是否被认领、多久之前） |
+| `tasks` | 任务总数，**恒等于** `inFlight + claimable + blocked + done` |
+| `blocked` | `pending`、未 `ready`、且无 owner —— 卡在依赖上的任务 |
+| `done` | `completed` 或 `deleted` |
+| `lastReclaim` / `lastDispatch` | 最近一次回收 / 派发的详情（哪个任务、从谁到谁、叫了几次、是否被认领、多久之前）；没发生过时显式打 `none` |
 | `breaker` | `closed` / `open` / `halfOpen` |
 | `breakerTrips` | 熔断打开次数 |
 | `breakerBlocked` | 因熔断而跳过的轮/任务数 |

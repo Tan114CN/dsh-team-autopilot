@@ -40,6 +40,13 @@ tick 由 `waitForChange(lead, tickTimeoutMs, signal)` 驱动：有团队变化�
 
 所以最长等待 ≈ `reclaimAfterMs + tickTimeoutMs`。按上面的配置是 **60s + 30s ≈ 90 秒内必见结果**。
 
+两条容易踩的时序细节（`0.3.1` 起）：
+
+- **每个团队每 interval 只 tick 一次**。一轮只服务「这一轮真的被唤醒的团队」，不会被别的团队顺带 tick。所以 N 个团队不会让某个团队的 `ticks` 变快——`ticks` 涨得比「秒数 ÷ `tickMs`」快，就说明在跑 `<0.3.1`。
+- **新出现的团队最多滞后一个 interval 才有第一次 tick**（它要等自己的 waiter 到期）。看到某个团队 `ticks` 比别的团队小 1、`(…ms ago)` 也更大，这是正常的，不是漏 tick。
+
+日志文件（`statusFile`）在这两件事上都帮不上忙：没变化的轮次不写行，只按 `statusHeartbeatMs` 打心跳。**验证时序请用 status 工具的 `ticks` 与 `(age)`，不要用日志文件的稀疏程度**。
+
 ## 3. 三个触发条件与可制造性
 
 | 条件 | 何时回收 | 真机能造出来吗 | 依赖配置 |
