@@ -119,7 +119,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     idle: 0,
     slots: 0,
   }
-  const lastWake = new Map<string, number>()
 
   ctx.tools.register(defineTool({
     name: 'team_scheduler_status',
@@ -164,7 +163,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.effect(() => {
     const controller = new AbortController()
     if (resolved.enabled) {
-      void loop(ctx, resolved, state, lastWake, controller.signal)
+      void loop(ctx, resolved, state, controller.signal)
     }
     return () => { controller.abort() }
   }, 'team-scheduler.loop()')

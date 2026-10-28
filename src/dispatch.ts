@@ -11,7 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import type { Config } from './index.ts'
-import { findLead } from './lead.ts'
+import { findLeads } from './lead.ts'
 import { availableMembers, claimableTasks, planDispatch, wakeMessage } from './select.ts'
 import type { DispatchPlan } from './select.ts'
 import {
@@ -219,9 +219,15 @@ export async function tick(
  * `{ timedOut: false }` in that case, which would otherwise look like activity.
  * Consecutive wait/tick failures back off exponentially (capped at 30s) so a
  * persistently broken host cannot spin the loop at full speed.
+ *
+ * The desktop host keeps several sessions (Teams) alive at once. Each round
+ * serves *every* live Lead, so a scheduler can never bind to the first-registered
+ * Team and ignore the rest. Per-team state (suppression stamps and the circuit
+ * breaker) is keyed by the Team identity resolved from each Lead, so one team's
+ * cooldown or breaker never bleeds into another's.
  * @param ctx - host context.
  * @param config - resolved configuration.
- * @param state - mutable counters.
+ * @param state - mutable counters (reports the most recently ticked team).
  * @param lastWake - per-task suppression timestamps.
  * @param signal - cancellation signal.
  */
@@ -229,48 +235,78 @@ export async function loop(
   ctx: Context,
   config: Required<Config>,
   state: SchedulerState,
-  lastWake: Map<string, number>,
   signal: AbortSignal,
 ): Promise<void> {
-  let breaker = createBreaker()
+  // Per-team runtime state, keyed by the TeamId resolved from each Lead.
+  const teamWake = new Map<string, Map<string, number>>()
+  const teamBreaker = new Map<string, Breaker>()
+  const teamFailures = new Map<string, number>()
   let failures = 0
+
+  const teamKeyFor = (lead: Agent): string => {
+    const membership = ctx.agentTeams.tryMembership(lead)
+    return membership === undefined ? 'default' : String(membership.id)
+  }
+
   // Drop suppression stamps that can no longer suppress anything, so the map
   // stays bounded by the number of tasks actually woken within one cooldown.
   const prune = (): void => {
     const cutoff = Date.now() - config.wakeCooldownMs
-    for (const [taskId, at] of lastWake) if (at < cutoff) lastWake.delete(taskId)
+    for (const wake of teamWake.values()) {
+      for (const [taskId, at] of wake) if (at < cutoff) wake.delete(taskId)
+    }
   }
+
   while (!signal.aborted) {
-    const lead = findLead(ctx)
-    if (lead === undefined) {
+    const leads = findLeads(ctx)
+    if (leads.length === 0) {
       await pause(2_000, signal)
       continue
     }
 
-    try {
-      await ctx.agentTeams.waitForChange(lead, config.tickTimeoutMs, signal)
-    } catch (error: unknown) {
+    // Register one waiter per live Lead, then tick each in turn. The waiter is
+    // registered before any board read so no edge can be missed.
+    let changed = false
+    for (const lead of leads) {
       if (signal.aborted) return
-      state.lastError = describe(error)
-      failures += 1
-      prune()
-      await pause(backoffMs(failures), signal)
-      if (signal.aborted) return
-      continue
+      try {
+        await ctx.agentTeams.waitForChange(lead, config.tickTimeoutMs, signal)
+        changed = true
+      } catch (error: unknown) {
+        if (signal.aborted) return
+        state.lastError = describe(error)
+        failures += 1
+        await pause(backoffMs(failures), signal)
+        if (signal.aborted) return
+        continue
+      }
     }
-    if (signal.aborted) return
 
-    try {
-      breaker = await tick(ctx, lead, config, state, lastWake, breaker, signal)
-      failures = 0
-    } catch (error: unknown) {
+    if (signal.aborted) return
+    if (!changed) continue
+
+    for (const lead of leads) {
       if (signal.aborted) return
-      state.lastError = describe(error)
-      failures += 1
-      prune()
-      await pause(backoffMs(failures), signal)
-      if (signal.aborted) return
-      continue
+      const teamKey = teamKeyFor(lead)
+      const wake = teamWake.get(teamKey) ?? new Map<string, number>()
+      teamWake.set(teamKey, wake)
+      let breaker = teamBreaker.get(teamKey) ?? createBreaker()
+
+      try {
+        breaker = await tick(ctx, lead, config, state, wake, breaker, signal)
+        teamFailures.set(teamKey, 0)
+        failures = 0
+      } catch (error: unknown) {
+        if (signal.aborted) return
+        state.lastError = describe(error)
+        const teamFail = (teamFailures.get(teamKey) ?? 0) + 1
+        teamFailures.set(teamKey, teamFail)
+        failures += 1
+        await pause(backoffMs(failures), signal)
+        if (signal.aborted) return
+        continue
+      }
+      teamBreaker.set(teamKey, breaker)
     }
     prune()
   }

@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- 多团队 bug：`findLead` 只取「第一个 Lead」，桌面宿主多会话并存时，调度器会永远绑定最早注册的团队、静默忽略其余（真实宿主联调复现）。现改为 `findLeads` 遍历所有 Lead，主循环为每个团队各跑一轮 `tick`，且 `lastWake`（冷却去重）与 `breaker`（熔断）按 `TeamId` 拆分，团队间互不干扰。
+
 ## [0.1.1] - 2026-10-28
 
 ### 修复

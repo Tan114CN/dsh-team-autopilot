@@ -68,8 +68,8 @@ dsh plugin --profile web add dsh-team-scheduler
 **2. 先挂 waiter，再读状态。**  
 `waitForChange` 内部只是一个 `Map<TeamId, Set<Waiter>>`，**没有任何历史缓冲**——注册之前发生的边沿永久丢失。所以顺序必须是「先 `waitForChange`，后全量 `listTasks`」，否则会漏掉窗口期内的变化。
 
-**3. 每轮重新解析 Lead。**  
-`waitForChange` / `listTasks` / `sendMessage` 都要求一个 **live** Agent 当凭证。Lead 实例在会话重组后会被替换，缓存引用会失效。所以每轮都走 `ctx.agents.list()` + `tryMembership()` 重新找。
+**3. 每轮重新解析 Lead（多团队各派各的）。**  
+`waitForChange` / `listTasks` / `sendMessage` 都要求一个 **live** Agent 当凭证。Lead 实例在会话重组后会被替换，缓存引用会失效。所以每轮都走 `ctx.agents.roots()` + `tryMembership()` 重新找——而且**遍历所有 Lead**，不是取第一个。桌面宿主会同时开着多个会话，每个会话就是一个独立 Team；若只取第一个 Lead，调度器会永远绑定最早注册的那个团队、静默忽略其余。现在主循环为每个 Lead 各跑一轮 `tick`，`lastWake`（冷却去重）和 `breaker`（熔断）都按 `TeamId` 拆分，团队之间互不干扰。
 
 **4. `inactive` 才是可唤醒状态。**  
 成员只有 4 态：`running` / `inactive` / `provisioning` / `failed`。**没有 `idle`**。`inactive` 表示当前没有回合在执行，`sendMessage` 会启动或恢复它。`running` 在干活、`provisioning` 还没起来、`failed` 已废。

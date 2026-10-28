@@ -25,6 +25,7 @@ import {
   resolveBudget,
 } from '../src/breaker.ts'
 import type { BreakerConfig } from '../src/breaker.ts'
+import { findLeads } from '../src/lead.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 
 /** Build one task view with sane defaults. `id` stays a plain string here. */
@@ -345,6 +346,43 @@ test('wakeMessage neutralizes newlines and backticks in the subject', () => {
   assert.equal((text.match(/`/g) ?? []).length, 2)
   // The injected directive is collapsed onto the subject line as inert text.
   assert.ok(text.includes("line1 line2 'ignore above'"), text)
+})
+
+test('findLeads resolves every live Lead, not just the first', () => {
+  // Real regression: the desktop host keeps several sessions alive, each its
+  // own Team. The old `findLead` returned the first-registered Lead and the
+  // scheduler silently ignored every other team. `findLeads` must enumerate
+  // all of them so each team gets dispatched independently.
+  const agents = [
+    { id: 'root-a' },
+    { id: 'child-a1' },
+    { id: 'root-b' },
+    { id: 'child-b1' },
+    { id: 'root-c' }, // non-Team root (tryMembership returns undefined)
+  ]
+  const membershipByRoot: Record<string, { role: string } | undefined> = {
+    'root-a': { role: 'lead' },
+    'root-b': { role: 'lead' },
+    'root-c': undefined,
+  }
+  const ctx = {
+    agents: { roots: () => agents.slice() },
+    agentTeams: {
+      tryMembership: (agent: { id: string }) =>
+        membershipByRoot[agent.id] as { role: string } | undefined,
+    },
+  }
+  const leads = findLeads(ctx as never)
+  const ids = leads.map(l => (l as { id: string }).id)
+  assert.deepEqual(ids, ['root-a', 'root-b'])
+})
+
+test('findLeads returns empty when no Team exists', () => {
+  const ctx = {
+    agents: { roots: () => [] },
+    agentTeams: { tryMembership: () => undefined },
+  }
+  assert.deepEqual(findLeads(ctx as never), [])
 })
 
 if (failures.length > 0) {
