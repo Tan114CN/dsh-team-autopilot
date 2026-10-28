@@ -141,6 +141,13 @@ export interface TeamState {
    * state bucket: the report shows the outcome, not the machinery.
    */
   lastDispatchPending: boolean
+  /**
+   * Everything the last written status line said except its timestamp and tick
+   * count, so an unchanged round can be recognised without writing it.
+   */
+  lastStatusSignature: string | undefined
+  /** Epoch milliseconds of the last written status line, if any. */
+  lastStatusAt: number | undefined
 }
 
 /** Autopilot-wide observable state. */
@@ -202,6 +209,8 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     slots: 0,
     lastTickAt: undefined,
     lastDispatchPending: false,
+    lastStatusSignature: undefined,
+    lastStatusAt: undefined,
   }
   state.teams.set(team, created)
   return created

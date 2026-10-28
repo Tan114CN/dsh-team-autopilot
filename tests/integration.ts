@@ -24,7 +24,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { createBreaker } from '../src/breaker.ts'
-import { tick } from '../src/dispatch.ts'
+import { tick, loop } from '../src/dispatch.ts'
 import { createAutopilotState } from '../src/state.ts'
 import type { AutopilotState } from '../src/state.ts'
 import type { Config } from '../src/index.ts'
@@ -137,6 +137,7 @@ const baseConfig: Required<Config> = {
   reclaimAfterMs: 300_000,
   reclaimOnFailed: true,
   statusFile: '',
+  statusHeartbeatMs: 600_000,
 }
 
 let passed = 0
@@ -490,6 +491,96 @@ await test('appends one status line per tick to the configured file', async () =
   const silent = freshState()
   await tick(makeCtx(host), lead, baseConfig, silent, 'team-1', new Map(), new Map(), createBreaker(), signal)
   assert.equal((await readFile(file, 'utf8')).trimEnd().split('\n').length, 2)
+})
+
+await test('writes nothing when a round changed nothing, and rewrites on the heartbeat', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-quiet-'))
+  const file = join(dir, 'status.log')
+  const host = makeHost([], [member('lead', 'running', 'lead')])
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, statusFile: file }
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+
+  // Three identical rounds, one line: the other two said nothing new.
+  const quiet = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.equal(quiet.length, 1)
+  assert.match(quiet[0] ?? '', /ticks=1/)
+
+  // A heartbeat that has elapsed is worth a line even when nothing changed.
+  const heartbeat: Required<Config> = { ...baseConfig, statusFile: file, statusHeartbeatMs: 0 }
+  await tick(makeCtx(host), lead, heartbeat, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  const beaten = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.equal(beaten.length, 2)
+  assert.match(beaten[1] ?? '', /ticks=4/)
+})
+
+/** One fake Lead per team, plus a host whose change-wait the test controls. */
+function makeLoopCtx(teams: number, options: { manual: boolean; intervalMs: number }) {
+  const leads = Array.from({ length: teams }, (_, index) => ({ id: `lead-${index}` }))
+  const pending: Array<() => void> = []
+  const ctx = {
+    agents: { roots: () => leads },
+    agentTeams: {
+      tryMembership: (candidate: unknown) => ({
+        id: `team-${leads.indexOf(candidate as { id: string })}`,
+        role: 'lead',
+      }),
+      listTasks: () => [],
+      listMembers: () => [member('lead', 'running', 'lead')],
+      sendMessage: async () => ({ messageId: 'm1' }),
+      updateTask: async () => undefined,
+      waitForChange: (_lead: unknown, timeoutMs: number, waitSignal: AbortSignal) =>
+        new Promise<void>(resolve => {
+          if (!options.manual) {
+            const timer = setTimeout(resolve, timeoutMs)
+            waitSignal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+            return
+          }
+          pending.push(resolve)
+        }),
+    },
+  }
+  return { ctx: ctx as unknown as Context, pending }
+}
+
+await test('ticks each team once per interval, not once per team per round', async () => {
+  const intervalMs = 30
+  const { ctx } = makeLoopCtx(3, { manual: false, intervalMs })
+  const state = freshState()
+  const controller = new AbortController()
+  const config: Required<Config> = { ...baseConfig, tickTimeoutMs: intervalMs }
+  void loop(ctx, config, state, controller.signal).catch(() => undefined)
+  await new Promise<void>(resolve => setTimeout(resolve, intervalMs * 10))
+  controller.abort()
+
+  const expected = Math.floor((intervalMs * 10) / intervalMs)
+  // The bug this replaced woke N rounds per interval and ticked every team on
+  // each one, so every team's count ran N times the number of intervals.
+  for (const team of state.teams.values()) {
+    assert.ok(team.ticks > 0, 'the loop never ticked')
+    assert.ok(
+      team.ticks <= expected + 2,
+      `${team.team} ticked ${team.ticks}x in ${expected} intervals`,
+    )
+  }
+})
+
+await test('serves only the team whose change-wait fired', async () => {
+  const { ctx, pending } = makeLoopCtx(2, { manual: true, intervalMs: 60_000 })
+  const state = freshState()
+  const controller = new AbortController()
+  const config: Required<Config> = { ...baseConfig, tickTimeoutMs: 60_000 }
+  void loop(ctx, config, state, controller.signal).catch(() => undefined)
+  // Both teams are armed in registration order, so index 1 is team-1.
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  pending[1]?.()
+  await new Promise<void>(resolve => setTimeout(resolve, 20))
+  controller.abort()
+
+  assert.equal(state.teams.get('team-1')?.ticks, 1)
+  assert.equal(state.teams.get('team-0'), undefined)
 })
 
 if (failures.length > 0) {

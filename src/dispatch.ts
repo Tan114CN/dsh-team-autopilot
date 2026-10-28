@@ -25,7 +25,7 @@ import {
 import type { Breaker, BreakerConfig, BreakerState } from './breaker.ts'
 import { createAutopilotState, teamState } from './state.ts'
 import type { AutopilotState, TeamState } from './state.ts'
-import { appendStatusLine, statusLine } from './observe.ts'
+import { appendStatusLine, statusLine, statusSignature } from './observe.ts'
 
 /**
  * Interruptible pause.
@@ -131,6 +131,35 @@ async function sendWake(
 }
 
 /**
+ * Append this round's status line, when a file is configured.
+ *
+ * Every exit from a round goes through here: a round that ends early because
+ * the breaker is open still has news worth writing down.
+ *
+ * A round that found nothing to do is not written at all. The loop ticks once
+ * per interval per team whether or not anything happened, so writing every
+ * round buries the rounds that matter under a wall of identical lines — on a
+ * real two-team host that was 2.8 MB a day, which pushed the file past its
+ * ceiling every hour and left barely half an hour of history to read. Instead
+ * the line is written the moment it differs from the last one, plus a heartbeat
+ * so a quiet autopilot is still visibly alive. `statusHeartbeatMs: 0` restores
+ * one line per round.
+ * @param config - resolved configuration.
+ * @param team - the team bucket, already updated for this round.
+ */
+async function recordStatus(config: Required<Config>, team: TeamState): Promise<void> {
+  if (config.statusFile === '') return
+  const now = Date.now()
+  const line = statusLine(team, now)
+  const signature = statusSignature(line)
+  const quietFor = team.lastStatusAt === undefined ? Infinity : now - team.lastStatusAt
+  if (signature === team.lastStatusSignature && quietFor < config.statusHeartbeatMs) return
+  team.lastStatusSignature = signature
+  team.lastStatusAt = now
+  await appendStatusLine(config.statusFile, line)
+}
+
+/**
  * One dispatch round: read the whole board, decide, then wake.
  *
  * The board is always re-read in full because `waitForChange` reports only
@@ -149,19 +178,6 @@ async function sendWake(
  * @param signal - cancellation signal.
  * @returns the next breaker state for this team.
  */
-/**
- * Append this round's status line, when a file is configured.
- *
- * Every exit from a round goes through here: a round that ends early because
- * the breaker is open still has news worth writing down.
- * @param config - resolved configuration.
- * @param team - the team bucket, already updated for this round.
- */
-async function recordStatus(config: Required<Config>, team: TeamState): Promise<void> {
-  if (config.statusFile === '') return
-  await appendStatusLine(config.statusFile, statusLine(team, Date.now()))
-}
-
 export async function tick(
   ctx: Context,
   lead: Agent,
@@ -398,16 +414,17 @@ export async function tick(
  * history. Consecutive wait/tick failures back off exponentially (capped at
  * 30s) so a persistently broken host cannot spin the loop at full speed.
  *
- * The desktop host keeps several sessions (Teams) alive at once. Each round
- * serves *every* live Lead, so a autopilot can never bind to the first-registered
- * Team and ignore the rest. Per-team state (suppression stamps and the circuit
- * breaker) is keyed by the Team identity resolved from each Lead, so one team's
- * cooldown or breaker never bleeds into another's.
+ * The desktop host keeps several sessions (Teams) alive at once. Every round
+ * serves the Leads whose own change-wait settled, so a autopilot can never bind
+ * to the first-registered Team and ignore the rest. Per-team state (suppression
+ * stamps and the circuit breaker) is keyed by the Team identity resolved from
+ * each Lead, so one team's cooldown or breaker never bleeds into another's.
  *
- * Every team carries its own armed waiter, and the round wakes on the first
- * one to fire. Awaiting the teams one after another instead would make the
- * dispatch latency grow with the number of live teams: a change in the first
- * team would still wait for the last team's timeout to expire.
+ * Every team carries its own armed waiter, and the round wakes on the first one
+ * to fire. Awaiting the teams one after another instead would make the dispatch
+ * latency grow with the number of live teams. Ticking every team on every wake
+ * would make the *work* grow quadratically, so the round serves only the teams
+ * whose wait settled — see `dirty` below.
  * @param ctx - host context.
  * @param config - resolved configuration.
  * @param state - autopilot state to update.
@@ -427,6 +444,19 @@ export async function loop(
   // One armed change-wait per team. A team's waiter is re-armed the moment it
   // fires, so no team is ever left unobserved and no edge slips through.
   const waiters = new Map<string, TeamWaiter>()
+  // Teams whose wait has settled since the last round. A round serves these and
+  // only these.
+  //
+  // Each team's wait expires on its own schedule, so with N live teams the
+  // pre-dirty loop woke N times per interval and then ticked every team on
+  // every wake: N² board reads where N would do. On a real host with two teams
+  // that already showed up as rounds 11.6s and 18.4s apart against a 30s
+  // interval — every team ticked twice per 30s, and `ticks` in the status line
+  // silently reading double its configured rate. Serving only the teams that
+  // actually woke keeps one tick per team per interval however many teams are
+  // live.
+  const dirty = new Set<string>()
+  let waitFailed = false
   let failures = 0
 
   const teamKeyFor = (lead: Agent): string => {
@@ -447,9 +477,11 @@ export async function loop(
     if (signal.aborted) return
     let failed = false
     const promise = ctx.agentTeams.waitForChange(lead, config.tickTimeoutMs, signal).then(
-      () => undefined,
+      () => { dirty.add(teamKey) },
       (error: unknown) => {
         failed = true
+        waitFailed = true
+        dirty.add(teamKey)
         if (!signal.aborted) state.lastError = describe(error)
       },
     )
@@ -479,6 +511,7 @@ export async function loop(
     const leads = findLeads(ctx)
     if (leads.length === 0) {
       waiters.clear()
+      dirty.clear()
       await pause(2_000, signal)
       continue
     }
@@ -500,13 +533,35 @@ export async function loop(
     }
 
     // Wake on the first team to report a change (or to time out), instead of
-    // waiting for every team's turn in turn.
-    await Promise.race([...waiters.values()].map(waiter => waiter.promise))
-    if (signal.aborted) return
+    // waiting for every team's turn in turn. A change that landed while the
+    // previous round was running is already queued in `dirty`, so it is served
+    // straight away instead of waiting out another interval.
+    if (dirty.size === 0) {
+      await Promise.race([...waiters.values()].map(waiter => waiter.promise))
+      if (signal.aborted) return
+    }
+
+    // A host whose change-wait fails must not spin the loop at full speed: the
+    // failed wait has already queued its team, so back off before serving it.
+    if (waitFailed) {
+      waitFailed = false
+      failures += 1
+      await pause(backoffMs(failures), signal)
+      if (signal.aborted) return
+    }
 
     state.rounds += 1
 
-    for (const lead of leads) {
+    // Serve the teams that actually woke this round. The status line reports
+    // one tick per team per interval; waking every team on every wake is what
+    // made that count grow with the number of live teams.
+    const woken = new Set(dirty)
+    dirty.clear()
+    const serving = woken.size === 0
+      ? leads
+      : leads.filter(lead => woken.has(teamKeyFor(lead)))
+
+    for (const lead of serving) {
       if (signal.aborted) return
       const teamKey = teamKeyFor(lead)
       const wake = teamWake.get(teamKey) ?? new Map<string, number>()

@@ -6,8 +6,9 @@
  * loop whose entire purpose is to run unattended is the wrong shape, and an
  * operator watching a headless team had no cheap way in.
  *
- * A file the host appends to by itself is that way in: one line per tick,
- * readable with `tail`, costing nothing — no model turn, no context, no tokens.
+ * A file the host appends to by itself is that way in: one line per *change*,
+ * plus a heartbeat while nothing changes, readable with `tail`, costing
+ * nothing — no model turn, no context, no tokens.
  *
  * It is also the *only* way in. The state lives in the host process's memory,
  * so no outside process can read it and no external tooling can observe a
@@ -20,9 +21,9 @@ import type { TeamState } from './state.ts'
 /**
  * Bytes after which the log is trimmed back to its trailing half.
  *
- * One line is roughly 250 bytes, so this holds a few thousand state changes —
- * far more than anyone reads — while keeping the file small enough that
- * `tail -30` stays instant.
+ * One line is roughly 250 bytes. Only changes and heartbeats are written, so a
+ * quiet team costs a few lines an hour and this ceiling holds weeks of history;
+ * a busy team reaches it in a day, and halving keeps the recent rounds.
  */
 const MAX_BYTES = 128 * 1024
 
@@ -74,6 +75,21 @@ export function statusLine(team: TeamState, at: number): string {
     parts.push(reclaim.applied ? 'reclaimed' : 'reclaim-dry-run')
   }
   return parts.join(' ')
+}
+
+/**
+ * Reduce a status line to what a reader would call "the same state".
+ *
+ * The timestamp and the tick count change on every round by construction, so
+ * comparing whole lines would never find two rounds alike. Everything else —
+ * the counters, the board shape, the last wake, the breaker — is what an
+ * operator actually reads, and what decides whether the round is worth writing
+ * down.
+ * @param line - a line produced by {@link statusLine}.
+ * @returns the line with its timestamp and tick count removed.
+ */
+export function statusSignature(line: string): string {
+  return line.replace(/^\S+ /, '').replace(/\sticks=\d+/, '')
 }
 
 /**

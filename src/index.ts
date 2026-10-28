@@ -56,12 +56,20 @@ export interface Config {
   /** Whether a `failed` owner hands its task back to the pool at once. */
   readonly reclaimOnFailed?: boolean
   /**
-   * File to append one status line to per tick. Empty disables it.
+   * File to append one status line to per change. Empty disables it.
    *
    * Use an absolute path: the host decides the working directory, and a
    * relative path would land wherever the app happens to be launched from.
    */
   readonly statusFile?: string
+  /**
+   * Rewrite an unchanged status line at least this often (ms). 0 disables the
+   * suppression and writes every tick.
+   *
+   * Only a change is worth a line; the heartbeat is what keeps "nothing is
+   * happening" distinguishable from "the autopilot died".
+   */
+  readonly statusHeartbeatMs?: number
 }
 
 /** Loader schema. */
@@ -78,6 +86,7 @@ export const Config: z<Config> = z.object({
   reclaimAfterMs: z.number().step(1).min(1_000).max(3_600_000).default(300_000),
   reclaimOnFailed: z.boolean().default(true),
   statusFile: z.string().default(''),
+  statusHeartbeatMs: z.number().step(1).min(0).default(600_000),
 })
 
 /** One reclaim the autopilot performed, as reported. */
@@ -261,6 +270,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     reclaimAfterMs: Math.min(Math.max(config.reclaimAfterMs ?? 300_000, 1_000), 3_600_000),
     reclaimOnFailed: config.reclaimOnFailed ?? true,
     statusFile: config.statusFile ?? '',
+    statusHeartbeatMs: config.statusHeartbeatMs ?? 600_000,
   }
   const state: AutopilotState = createAutopilotState()
 

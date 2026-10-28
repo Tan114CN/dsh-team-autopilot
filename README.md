@@ -139,7 +139,8 @@ dsh plugin --profile web add dsh-team-autopilot
 | `halfOpenProbe`  | `1`     | 半开阶段允许的探针派发次数               |
 | `reclaimAfterMs` | `300000` | 持有者 `inactive` 持续多久后把任务收回池子（1000–3600000） |
 | `reclaimOnFailed` | `true`  | 持有者 `failed` 时是否立即回收            |
-| `statusFile`     | `''`    | 每 tick 追加一行状态到该文件（绝对路径），空 = 关闭。见下「零 token 观测」 |
+| `statusFile`     | `''`    | 状态有变化时追加一行到该文件（绝对路径），空 = 关闭。见下「零 token 观测」 |
+| `statusHeartbeatMs` | `600000` | 状态未变也至少这么久写一行；`0` = 逐轮写 |
 
 ## 设计决策（都来自源码核验）
 
@@ -355,7 +356,7 @@ team-autopilot:
   statusFile: C:/Users/you/.dsh/profiles/desktop/team-autopilot.log
 ```
 
-每 tick 追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒）：
+只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒）：
 
 ```
 2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 unclaimed=2 reclaimed=0 tasks=4 inFlight=0 claimable=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
@@ -369,6 +370,7 @@ tail -20 team-autopilot.log | grep 'unclaimed=[1-9]'   # 出现过未认领的�
 grep -c 'outcome=unclaimed' team-autopilot.log  # 累计多少次唤醒石沉大海
 ```
 
+- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两天团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写
 - 默认**关闭**，仓库模板也不开——插件不主动往磁盘写东西
 - 写入失败一律静默：观测是便利，满盘或只读 profile 不能卡住派发
 - **熔断打开导致这一轮没派发时也会写**——那正是最该看日志的时刻，静默等于在最需要的时候失声
