@@ -25,6 +25,7 @@ import {
 import type { Breaker, BreakerConfig, BreakerState } from './breaker.ts'
 import { createAutopilotState, teamState } from './state.ts'
 import type { AutopilotState, TeamState } from './state.ts'
+import { appendStatusLine, statusLine } from './observe.ts'
 
 /**
  * Interruptible pause.
@@ -148,6 +149,19 @@ async function sendWake(
  * @param signal - cancellation signal.
  * @returns the next breaker state for this team.
  */
+/**
+ * Append this round's status line, when a file is configured.
+ *
+ * Every exit from a round goes through here: a round that ends early because
+ * the breaker is open still has news worth writing down.
+ * @param config - resolved configuration.
+ * @param team - the team bucket, already updated for this round.
+ */
+async function recordStatus(config: Required<Config>, team: TeamState): Promise<void> {
+  if (config.statusFile === '') return
+  await appendStatusLine(config.statusFile, statusLine(team, Date.now()))
+}
+
 export async function tick(
   ctx: Context,
   lead: Agent,
@@ -173,6 +187,10 @@ export async function tick(
   team.breaker = breaker.state
   if (!verdict.canDispatch) {
     team.breakerBlocked += 1
+    // Logged here too: a blocked round is exactly when the file is worth
+    // reading, and skipping it would make the log go quiet at the one moment
+    // an operator needs it to speak.
+    await recordStatus(config, team)
     return breaker
   }
 
@@ -365,6 +383,10 @@ export async function tick(
       break
     }
   }
+
+  // Last thing in the round, so the line records the state the round produced
+  // rather than the one it started from — including the wakes just sent.
+  await recordStatus(config, team)
   return breaker
 }
 

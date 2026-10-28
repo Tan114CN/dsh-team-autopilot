@@ -139,6 +139,7 @@ dsh plugin --profile web add dsh-team-autopilot
 | `halfOpenProbe`  | `1`     | 半开阶段允许的探针派发次数               |
 | `reclaimAfterMs` | `300000` | 持有者 `inactive` 持续多久后把任务收回池子（1000–3600000） |
 | `reclaimOnFailed` | `true`  | 持有者 `failed` 时是否立即回收            |
+| `statusFile`     | `''`    | 每 tick 追加一行状态到该文件（绝对路径），空 = 关闭。见下「零 token 观测」 |
 
 ## 设计决策（都来自源码核验）
 
@@ -195,8 +196,8 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 39 checks passed
-node tests/integration.ts                       # → OK — 13 integration checks passed
+node tests/verify.ts                            # → OK — 42 checks passed
+node tests/integration.ts                       # → OK — 16 integration checks passed
 node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
@@ -342,6 +343,37 @@ teams=N
 全部空闲成员都拒绝过时，派发**主动停手**：`declined` 计数上涨并打一行 note，而不是继续对着同一批成员重复唤醒烧 token。这是刻意的取舍——循环每轮都发消息且掩盖问题，停手不花钱且一眼看得见。
 
 任务一旦易手（被认领、完成、或回收回池），该任务的拒绝记录立即清空，避免把一次「当时正忙」记成永久黑名单。
+
+## 零 token 观测：`statusFile`
+
+status 工具每次调用都要一整轮对话，报告还会一直留在上下文里。而插件状态活在宿主进程内存中，**外部进程读不到**——想不烧 token 地看，只有让插件自己写下来这一条路。
+
+配一个**绝对路径**即开启：
+
+```yaml
+team-autopilot:
+  statusFile: C:/Users/you/.dsh/profiles/desktop/team-autopilot.log
+```
+
+每 tick 追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒）：
+
+```
+2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 unclaimed=2 reclaimed=0 tasks=4 inFlight=0 claimable=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
+```
+
+单行是刻意的：`tail -1` 是当前状态，`tail -30` 是最近历史，`grep -c` 数得出重复次数。多行美化版必须整份读完才有用，那对日志等于永远不会被读。
+
+```bash
+tail -1 team-autopilot.log                      # 现在什么状态
+tail -20 team-autopilot.log | grep 'unclaimed=[1-9]'   # 出现过未认领的轮次
+grep -c 'outcome=unclaimed' team-autopilot.log  # 累计多少次唤醒石沉大海
+```
+
+- 默认**关闭**，仓库模板也不开——插件不主动往磁盘写东西
+- 写入失败一律静默：观测是便利，满盘或只读 profile 不能卡住派发
+- **熔断打开导致这一轮没派发时也会写**——那正是最该看日志的时刻，静默等于在最需要的时候失声
+- 超过 128 KB 自动裁掉前半，保留尾部
+- `dryRun` 下照写，回收记为 `reclaim-dry-run`——要看的是判定，不是副作用
 
 ## 边界
 

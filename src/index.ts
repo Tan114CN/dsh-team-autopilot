@@ -55,6 +55,13 @@ export interface Config {
   readonly reclaimAfterMs?: number
   /** Whether a `failed` owner hands its task back to the pool at once. */
   readonly reclaimOnFailed?: boolean
+  /**
+   * File to append one status line to per tick. Empty disables it.
+   *
+   * Use an absolute path: the host decides the working directory, and a
+   * relative path would land wherever the app happens to be launched from.
+   */
+  readonly statusFile?: string
 }
 
 /** Loader schema. */
@@ -70,6 +77,7 @@ export const Config: z<Config> = z.object({
   halfOpenProbe: z.number().step(1).min(1).max(16).default(1),
   reclaimAfterMs: z.number().step(1).min(1_000).max(3_600_000).default(300_000),
   reclaimOnFailed: z.boolean().default(true),
+  statusFile: z.string().default(''),
 })
 
 /** One reclaim the autopilot performed, as reported. */
@@ -252,6 +260,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     halfOpenProbe: config.halfOpenProbe ?? 1,
     reclaimAfterMs: Math.min(Math.max(config.reclaimAfterMs ?? 300_000, 1_000), 3_600_000),
     reclaimOnFailed: config.reclaimOnFailed ?? true,
+    statusFile: config.statusFile ?? '',
   }
   const state: AutopilotState = createAutopilotState()
 

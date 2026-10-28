@@ -17,6 +17,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
@@ -133,6 +136,7 @@ const baseConfig: Required<Config> = {
   halfOpenProbe: 1,
   reclaimAfterMs: 300_000,
   reclaimOnFailed: true,
+  statusFile: '',
 }
 
 let passed = 0
@@ -195,6 +199,30 @@ await test('trips the circuit breaker after consecutive send failures', async ()
   breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
   assert.equal(host.attempts, before, 'no dispatch may happen while the breaker is open')
   assert.ok(teamOf(state).breakerBlocked >= 1, 'the open breaker must have blocked a round')
+})
+
+await test('logs a blocked round instead of going quiet when the breaker is open', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-breaker-'))
+  const file = join(dir, 'status.log')
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+  )
+  host.failSend = true
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, errorThreshold: 1, statusFile: file }
+  const ctx = makeCtx(host)
+  let breaker = createBreaker()
+  breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
+  assert.equal(breaker.state, 'open')
+
+  // The round that the breaker blocks returns early — it must still log, or
+  // the file falls silent at the exact moment the team is stuck.
+  breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), breaker, signal)
+  const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  assert.equal(lines.length, 2)
+  assert.match(lines[1] ?? '', /breaker=open/)
+  assert.match(lines[1] ?? '', /held=1/)
 })
 
 await test('honours the per-team budget keyed by TeamId', async () => {
@@ -437,6 +465,31 @@ await test('waits out the grace period before reclaiming an inactive owner', asy
   await tick(makeCtx(host), lead, baseConfig, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
   assert.deepEqual(host.updates, [])
   assert.equal(teamOf(state).reclaimed, 0)
+})
+
+await test('appends one status line per tick to the configured file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-observe-'))
+  const file = join(dir, 'status.log')
+  const host = makeHost(
+    [task({ id: 't1' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, statusFile: file }
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+
+  const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  // One line per round, in order: `tail -1` is the current state.
+  assert.equal(lines.length, 2)
+  assert.match(lines[0] ?? '', /team=team-1 ticks=1/)
+  assert.match(lines[1] ?? '', /team=team-1 ticks=2/)
+  // The wake sent in the first round is still on record in the second line.
+  assert.match(lines[1] ?? '', /wake=t1>alice wakes=1 outcome=(claimed|unchecked|unclaimed)/)
+  // A round with no file configured writes nothing at all.
+  const silent = freshState()
+  await tick(makeCtx(host), lead, baseConfig, silent, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal((await readFile(file, 'utf8')).trimEnd().split('\n').length, 2)
 })
 
 if (failures.length > 0) {

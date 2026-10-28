@@ -31,6 +31,9 @@ import { renderReport } from '../src/report.ts'
 import type { StatusReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { planReclaim } from '../src/reclaim.ts'
+import { statusLine } from '../src/observe.ts'
+import { teamState } from '../src/state.ts'
+import { createAutopilotState } from '../src/state.ts'
 
 /** Build one task view with sane defaults. `id` stays a plain string here. */
 function task(over: Omit<Partial<TeamTaskView>, 'id'> & { id: string }): TeamTaskView {
@@ -659,6 +662,48 @@ test('never reclaims from a running owner or from the Lead', () => {
   })
   assert.equal(result.releases.length, 0)
   assert.equal(result.stalled.size, 0)
+})
+
+test('statusLine stays one greppable line and grows as decisions happen', () => {
+  const team = teamState(createAutopilotState(), 'team-a')
+  team.ticks = 3
+  team.dispatched = 1
+  team.skipped = 2
+  team.skippedScope = 1
+  team.skippedDeclined = 1
+  team.unclaimed = 1
+  team.tasks = 2
+  team.claimable = 1
+  team.idle = 2
+  team.slots = 2
+
+  const idle = statusLine(team, 0)
+  // A log line has to stay on one line: `tail -1` is the whole point.
+  assert.equal(idle.includes('\n'), false)
+  assert.match(idle, /^1970-01-01T00:00:00\.000Z team=team-a /)
+  assert.match(idle, /ticks=3 dispatched=1 suppressed=0 /)
+  assert.match(idle, /skip=2 scope=1 noMember=0 declined=1 /)
+  assert.match(idle, /unclaimed=1 reclaimed=0 tasks=2 inFlight=0 claimable=1 idle=2 slots=2 /)
+  assert.match(idle, /breaker=closed trips=0 held=0$/)
+  assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
+
+  // An unjudged wake reads "unchecked", never "unclaimed": the instant a wake
+  // is sent, an answered and an ignored one are indistinguishable.
+  team.lastDispatch = { taskId: 't1', memberName: 'alice', at: 0, repeats: 1, sent: true }
+  assert.match(statusLine(team, 0), /wake=t1>alice wakes=1 outcome=unchecked/)
+  if (team.lastDispatch !== undefined) team.lastDispatch.claimed = false
+  assert.match(statusLine(team, 0), /outcome=unclaimed/)
+
+  // A dry-run reclaim is logged too: what matters is the decision, not the
+  // side effect that followed from it.
+  team.lastReclaim = {
+    taskId: 't1',
+    reason: 'owner inactive',
+    previousOwner: 'bob',
+    at: 0,
+    applied: false,
+  }
+  assert.match(statusLine(team, 0), /reclaim=t1<bob reclaim-dry-run$/)
 })
 
 if (failures.length > 0) {

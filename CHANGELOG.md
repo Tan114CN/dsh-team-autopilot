@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.0] - 2026-10-28
 
 ### 新增
 
@@ -14,6 +14,11 @@
   - 拒绝记录随任务易手清空（被认领 / 完成 / 回收回池），避免把一次「当时正忙」记成永久黑名单。
   - 拒绝集合与回收的 `previousOwner` 共用一条通道：`planDispatch` 的 `avoid` 由 `Map<string, string>` 改为 `Map<string, ReadonlySet<string>>`，两者在决策时含义相同——「这个成员在这个任务上已经轮到过了」。
 - `team_autopilot_status` 的 `skipped` 增加第三个分类 `declined`（`scope` / `noMember` / `declined`），`BlockedTask.kind` 同步扩展。三种原因三种处置：放宽写域、加成员、查成员为什么不接。
+- **`statusFile` 配置项：零 token 观测**。每 tick 追加一行状态到指定文件，`tail -1` 即当前状态。
+  - 动机：status 工具每次调用要一整轮对话，报告还会留在上下文里；而插件状态活在宿主进程内存中，外部进程读不到——不烧 token 地观测只有「插件自己写下来」这一条路。
+  - 单行格式而非多行块：`tail -1` / `grep` 才能直接用，多行美化版必须整份读完才有用。
+  - 默认关闭（空字符串），写入失败静默（观测不能卡住派发），超 128 KB 裁掉前半，`dryRun` 下照写且回收记为 `reclaim-dry-run`。
+  - 熔断打开导致该轮未派发时**同样写入**：那正是最需要看日志的时刻，静默等于在最需要的时候失声。
 
 ### 行为变更
 
