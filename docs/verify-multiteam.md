@@ -1,17 +1,18 @@
-# 验证 0.1.2 多团队修复
+# 多团队验证手册
 
-> 目的：确认 `dsh-team-autopilot@0.1.2` 修好了「调度器只盯第一个 Lead」的 bug，
-> 现在能同时服务多个团队会话、各自独立派发。
+> 目的：确认调度器能**同时服务多个团队会话、各自独立派发**，互不串台。
+>
+> 历史：`0.1.1` 及以前只取第一个 Lead，桌面宿主多会话并存时会永远绑定最早那个团队、静默忽略其余；`0.1.2` 修掉。这份手册现在的作用是**回归验证**——每当改动主循环或 Lead 解析（如 `0.3.1` 的一轮只服务被唤醒团队），都值得重跑一遍。
 
 ---
 
 ## 一、前置
 
-1. 已装 `0.1.2`（profile 依赖 `^0.1.2`，`verify-mount` 10 PASS）。
-2. `cordis.patch.yml` 里 `team-autopilot.dryRun` 当前是 **`true`**。
-   - **只验证「调度器是否盯对团队」**：`dryRun:true` 就够（`dispatched` 会涨、`team=` 会显示正确 TeamId，只是不发消息）。
+1. 已装当前版本（`0.3.5` 起有 `why=` / `pending=` 字段），`node scripts/verify-mount.mjs` 除 `first-run dryRun` 一项外全 PASS。
+2. `cordis.patch.yml` 里 `team-autopilot.dryRun` 决定验到哪一层：
+   - **只验证「调度器是否盯对团队」**：`dryRun: true` 就够（`dispatched` 会涨、`team=` 会显示正确 TeamId，只是不发消息）。
    - **想验证「真的发唤醒消息」**：把 `dryRun` 改成 `false` 再重启。
-3. **完全重启 Harness**（加载 0.1.2）。
+3. **完全退出并重启 App**（不是关窗口）。
 
 ---
 
@@ -85,6 +86,6 @@
 
 | 现象 | 含义 | 处理 |
 |---|---|---|
-| 两个会话 `team=` 相同 | 修复没生效（可能还在跑旧版） | 确认 profile 版本是 0.1.2、重启 Harness |
+| 两个会话 `team=` 相同 | Lead 解析又只取了一个（回归） | 先确认在跑的是当前版本（`grep autopilot-start`），再重启 App；若仍如此，把两份 status 贴出来 |
 | `dispatched=0` 但 `team=` 正确 | 没有「空闲成员」或任务没 ready | 确认 worker 是 inactive、任务是 pending+ready |
 | `claimable=0` | 任务已被认领（可能成员自发认领了） | 看任务 owner 是否已变，或重开干净会话 |

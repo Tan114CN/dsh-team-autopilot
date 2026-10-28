@@ -12,11 +12,12 @@
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
   team=<id> ... reclaimed=N unclaimed=N pending=N
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
-    lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed (<age>)
+    lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
 
 - 第一处是全局累计，第二处是按团队（多团队时逐个打印）
 - `lastError` 非空 = 上一次 `reassign` 调用失败（revision 冲突最常见），**不熔断**，下一轮会重读重试
+- `outcome=unchecked` 表示**还没到判定时刻**（判定要等 `wakeCooldownMs` 到期），不是「没认领」；配合 `pending=N` 看还有几条在等判定。回收场景里它很常见：任务刚被重新派出去，判定还在冷却窗口内
 
 **判定时务必同时看 `lastReclaim`**：`reclaimed` 只回答「几次」，`lastReclaim` 回答「哪个任务、从谁手里、为什么」。回收循环（同一任务被反复收回）只有后者能看出来——否则只能盯着任务 revision 往上爬来推断。
 

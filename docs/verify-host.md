@@ -15,8 +15,10 @@ node scripts/verify-mount.mjs
 # 或 npm run verify:mount
 ```
 
-- **重启前**期望：`OK — 10 mount checks passed, 1 warning(s)`（WARN = 日志里还没有 team-autopilot，属正常）。
-- **重启后**期望：同一命令的 WARN 变成 **PASS**，仍然 `OK ...`。
+- **重启前**期望：`OK — 10 mount checks passed, 1 warning(s) for <profile>`（WARN = 日志里还没有 team-autopilot，属正常）。
+- **重启后**期望：同一命令的 WARN 变成 **PASS**，仍是 `OK …` 开头。
+
+> 一旦你在「首次安全模式」之外跑过（把 `dryRun` 改成 `false`），`first-run dryRun === true` 这一项**会一直是 FAIL**，汇总行也变成 `FAILED — 1/11 checks failed`。这是**预期结果，不是故障**：那条检查守的是「第一次装上时必须是 dryRun」，不是「永远是 dryRun」。判断插件是否正常，看其余 10 项是否全 PASS。
 
 逐项含义与失败处理：
 
@@ -24,13 +26,13 @@ node scripts/verify-mount.mjs
 |---|---|---|
 | `profile directory exists` | profile 目录在 | 确认路径，或用 `DSH_PROFILE=...` 指定 |
 | `bundle "dsh-team-autopilot" registered` | `dsh.profile.bundles` 含本插件 | 在 `package.json` 的 bundles 追加一行 |
-| `dependency declared` | 依赖用 `file:./dsh-team-autopilot-*.tgz` | 修正 `dependencies` 并重装 |
+| `dependency declared` | `dependencies` 里有本插件（registry 版本写 `^x.y.z`；本地 tarball 写 `file:./*.tgz`） | 修正 `dependencies` 后重装 |
 | `entry "main" is dist/index.mjs` | 包入口指向构建产物 | 重新 `npm run build` + repack |
 | `dist/index.mjs built` | 构建产物存在 | 同上 |
 | `cordis.patch.yml shipped` | 包内携带 patch | 确认 `files` 白名单含它 |
-| `lockfile records ... (file:)` | pnpm 记为 tarball 依赖（持久） | 还原 lockfile 备份后重装 |
+| `lockfile records dsh-team-autopilot` | 锁文件里有这个依赖（registry 与 `file:` 两种写法都认） | 见 README「桌面 profile 的三个坑」第 3 条 |
 | `profile patch targets team-autopilot` | profile patch 覆盖了本插件 | 补 `- id: team-autopilot` 段 |
-| `first-run dryRun === true` | 首次安全模式 | 补/改 `dryRun: true` |
+| `first-run dryRun === true` | 首次安全模式 | 首次安装时补 `dryRun: true`；已经跑过就不必管 |
 | `logs mention team-autopilot`（WARN/PASS） | 运行日志出现过本插件 | 见第 3 节排查 |
 
 ---
@@ -202,14 +204,18 @@ grep -ri "team-autopilot" ~/.dsh/profiles/desktop/.plugin-manager/logs | tail -2
 
 ## 6. 回滚
 
+**不要靠 `*.bak` 文件**：profile 里那些代际备份已经清掉了，而且锁文件备份里的旧条目本身可能就是问题的源头（见 README 桌面版三条坑的第 3 条）。回滚到某个版本只有一条命令：
+
 ```bash
 cd ~/.dsh/profiles/desktop
-cp package.json.bak-20261027-233651 package.json
-cp pnpm-lock.yaml.bak-20261027-233651 pnpm-lock.yaml
-cp cordis.patch.yml.bak-20261027-233651 cordis.patch.yml
-rm -rf node_modules/dsh-team-autopilot
-# 重启 App
+node ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.cjs \
+  add dsh-team-autopilot@<版本>
+# 完全退出并重启 App
 ```
+
+- **只想停掉插件、不换版本**：把 `cordis.patch.yml` 里 `team-autopilot` 段的 `enabled` 设为 `false`，或者整段删掉。bundle 不挂载就不会加载，比卸载更干净。
+- 回滚前先 `grep autopilot-start <statusFile> | tail -1` 确认当前跑的版本——否则很容易把「已经降回去了」误判成「升级没生效」。
+- 目标版本若发布不足 24 小时，会被 `minimumReleaseAge` 拦住，处理办法见 README 桌面版三条坑的第 2 条。
 
 ---
 
@@ -223,11 +229,17 @@ rm -rf node_modules/dsh-team-autopilot
 | `suppressed` | 被冷却窗口抑制的次数 |
 | `skipped` | 被跳过的任务数（累计），括号里拆成 `scope`（写域冲突）/ `noMember`（无空闲成员）/ `declined`（空闲成员全都拒绝过这个任务） |
 | `unclaimed` | 唤醒后**过了冷却窗口**仍无主的次数；持续上涨 = 有成员从不接活。刚唤醒的几秒内不会判定，这是刻意的 |
+| `pending` | **已发出、还没到判定时刻**的唤醒条数。`outcome` 只反映最近一条唤醒，一轮唤醒两个任务时，另一个只能从这里看出来 |
 | `tasks` | 任务总数，**恒等于** `inFlight + claimable + blocked + done` |
+| `inFlight` | 正在占用并发槽的任务：`in_progress`，或 `pending` 但已有 owner（已认领未开工） |
+| `claimable` | `pending` + `ready` + 无 owner —— 该派就派的那一类 |
 | `blocked` | `pending`、未 `ready`、且无 owner —— 卡在依赖上的任务 |
 | `done` | `completed` 或 `deleted` |
+| `idle` | 可接新活的成员数（只数 `role=teammate` 且 `inactive` 的，**不含 Lead**） |
+| `slots` | 剩余并发槽（`maxConcurrent`／`teamBudgets` 减去在飞） |
 | `lastReclaim` / `lastDispatch` | 最近一次回收 / 派发的详情（哪个任务、从谁到谁、叫了几次、是否被认领、多久之前）；没发生过时显式打 `none` |
 | `breaker` | `closed` / `open` / `halfOpen` |
 | `breakerTrips` | 熔断打开次数 |
 | `breakerBlocked` | 因熔断而跳过的轮/任务数 |
 | `lastError` | 最近一次错误文本 |
+| `why` | **只在日志行里，status 没有这个字段**。本轮跳过原因的集合（`scope` / `noMember` / `declined`，无跳过时 `-`），去重排序；只在原因变化时才写行，所以「全员拒接、插件停手」会立刻落一行而不用等心跳 |

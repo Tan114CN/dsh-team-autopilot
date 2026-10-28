@@ -34,7 +34,7 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 | 做法                  | 把派发规则写成策略文本注入 `systemPrompt`，由主 agent 每步读取并自觉调工具 | 后台 tick 扫描任务板，由代码判定并唤醒  |
 | 决策成本              | 每步都要读策略文本，决策本身在烧 token                        | 零 token                              |
 | 失效模式              | 模型不遵守即完全失效                                        | 规则既定即执行                        |
-| 代表                  | `dsh-agent-dispatch`、`dsh-eteams`、`dsh-plugin-teamflow`、`dsh-agent-hub` | 本插件（原生 seam）、`@nanmicoder/dsh-agent-teams`（自建状态） |
+| 代表                  | `dsh-eteams`、`dsh-plugin-teamflow`、`dsh-agent-hub` 等 | 本插件（原生 seam）、`@nanmicoder/dsh-agent-teams`（自建状态） |
 
 另一个维度是**团队状态存在哪**。上面那些模型驱动插件几乎都是自建派——自带 SQLite 或文件存储、自己的任务板与成员表，与官方 Teams 的状态互不认。原生派（状态直接来自 `ctx.agentTeams`）在第三方里目前只有本插件。选错派等于白装：你已经在用官方 Teams，装一个自建派插件只会得到第二套互不相通的任务板。
 
@@ -53,7 +53,7 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 | 一起装的对象                    | 结论                     | 原因                                                                                                            |
 | ------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------- |
 | 官方 `experimental-agent-team`  | **必须装**（是依赖）     | 本插件只读任务板，写操作只有两个：唤醒（`sendMessage`）与回收（`reassign`），用的都是官方自己的 action 和 Lead 身份 |
-| 模型驱动插件（`dsh-agent-dispatch`） | **可以叠加，且互补** | 它只注入 `systemPrompt` 策略文本，不持有状态、不注册调度器；本插件注入 0 段 prompt                                |
+| 模型驱动派插件（把规则写进 `systemPrompt`） | **可以叠加，且互补** | 它只注入策略文本，不持有状态、不注册调度器；本插件注入 0 段 prompt                                |
 | `@nanmicoder/dsh-agent-teams`   | **不要同时装**           | 两个确定性调度器并行，且回收语义相反                                                                              |
 
 ### 与官方：争用是可恢复的
@@ -64,27 +64,15 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 
 ### 与模型驱动：时钟互补，不是竞争
 
-`dsh-agent-dispatch` 的全部机制是把派发规则写成文本塞进 `systemPrompt`，靠主 agent 每步读取后自觉调工具。它自己不写状态，所以和我们的两个写操作没有交集。默认配置下更干净——它的 teams 渠道默认 `false`，开了也是走自建层，不碰原生任务板。
+模型驱动派的机制是把派发规则写成文本塞进 `systemPrompt`，靠主 agent 每步读取后自觉调工具。它不写团队状态，所以和我们的两个写操作（唤醒、回收）没有交集。
 
 真正的价值是时钟不同源：它的检查节奏绑在主 agent 的 step loop 上（主 agent idle、等用户、被 interrupt 时都不检查），而官方那条限制 `Task readiness never starts an owner` 描述的恰恰是没有活跃主 agent 的时刻。两者覆盖的是不同时间段，可以都装。
 
 如果一起装，建议把 `wakeCooldownMs` 调大（默认 60s）。它按「任务 × 成员」去重，能减少主 agent 自己派活时与 tick 的重复唤醒。
 
-#### 它和官方 Agent Teams 冲突吗
+> **引用变化（2026-10-28 复核）**：这一节原先用一个具体包做样本，逐字段核对过它的 `inject`、注册的工具名与 channels 默认值。该包**已从 registry 下架**（`npm view` 返回 404），那些细节因此无法复现，只保留「这一类做法与本插件互补」的结论。要判断某个模型驱动插件能否共存，看它写哪套状态即可：只注入 prompt、不碰任务板 → 可叠加；经自建层改状态（例如 `@nanmicoder/dsh-agent-teams`）→ 互斥。
 
-基本不冲突，接触面比想象中还小（均来自解包 / README 核验）：
-
-- `dsh-agent-dispatch` 的 `inject = []`——它**不注入也不依赖 `ctx.agentTeams`**，只机会性获取 `webServer` / `systemPrompt` / `llm` 三个服务，任一缺失仅丢对应能力。
-- 官方 `experimental-agent-team` **本身不注入 `systemPrompt`**（包内 `prompt` 只出现在 spawn 请求与 `steerHostSubagentPrompt` 上），它提供的是 `ctx.agentTeams` 服务与 `team/*` 事件。两者不在同一个注入面上。
-- 官方注册 9 个团队工具（`send_message` / `spawn_teammate` / `wait_agent` / `interrupt_agent` / `list_agents` / `team_task_{create,get,list,update}`），agent-dispatch 注册 0 个——无工具名冲突。
-
-**但它的 teams 通道是空转的**（这条是推断，未实测）：`channels.teams` 默认 `false`，即便打开，其策略文本指向的团队工具（`agent_teams_status` / `agent_teams_reassign_task`）是 `@nanmicoder/dsh-agent-teams` 注册的，**不是官方 API**。只装官方 Teams 时模型按策略去调这些不存在的工具，不会崩，但那条通道不工作。
-
-换句话说，它与 `@nanmicoder/dsh-agent-teams` 是**上下层而非同类**：agent-dispatch 是决策层（要不要派、派给谁），nanmicoder 是执行层（自建状态 + 调度器 + 14 个工具）。所以——只装 agent-dispatch 时 teams 通道空转，与本插件可共存；**一旦同时装了 nanmicoder，teams 通道接通，此时与本插件不可共存**（它会经 nanmicoder 改另一套任务状态，我们改原生任务板）。
-
-**结论：在官方 Agent Teams 上，"任务就绪后有人接"这件事只有本插件能做。** agent-dispatch 在此环境下能发挥的只有 `workflow` / `subagent` 通道——帮主 agent 把低风险机械活外包给 helper，那是另一件事，与团队任务板无关。两者的痛点不同，可以叠加而非二选一。
-
-所以三者（官方 + 本插件 + agent-dispatch）可以同装：让它走 `workflow` / `subagent` 通道做语义路由，团队侧交给本插件。注意它默认目标 profile 是 `web`，headless 下面板不可用、`systemPrompt` 注入仍然生效。
+**结论：在官方 Agent Teams 上，"任务就绪后有人接"这件事只有本插件能做。** 模型驱动插件在此环境里能发挥的是把低风险机械活外包给 helper（`workflow` / `subagent` 通道），与团队任务板无关。两者的痛点不同，可以叠加而非二选一。
 
 ### 与 nanmicoder：是替代关系，不是叠加
 
@@ -194,15 +182,15 @@ npm publish             # prepack 自动重建 dist；prepublishOnly 跑类型�
 ```
 
 - `dist/` 被 `.gitignore` 忽略，但 `prepack` 会在打包前强制重建，所以**从干净检出发布也安全**。
-- 版本号手动改 `package.json`（本项目不使用 changesets），并同步更新 `CHANGELOG.md` 的 `[Unreleased]` / 新版本段。请用 `npm publish`，不要用 `pnpm publish`。
+- 版本号手动改 `package.json`（本项目不使用 changesets），并同步在 `CHANGELOG.md` 顶部加新版本段。请用 `npm publish`，不要用 `pnpm publish`。
 - 发布后自检：`npm view dsh-team-autopilot dist.tarball`，或 `npm pack dsh-team-autopilot && tar -tzf dsh-team-autopilot-*.tgz`。
 
 ## 已验证
 
 ```bash
 node node_modules/typescript/bin/tsc --noEmit   # → 零错误
-node tests/verify.ts                            # → OK — 42 checks passed
-node tests/integration.ts                       # → OK — 16 integration checks passed
+node tests/verify.ts                            # → OK — 44 checks passed
+node tests/integration.ts                       # → OK — 24 integration checks passed
 node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
 node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
@@ -213,8 +201,8 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
-- **零依赖自检**：纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）有 21 项断言覆盖。`select.ts` / `breaker.ts` 只有 `import type` 或无外部依赖，所以 `node tests/verify.ts` 不需要任何 `node_modules` 也能跑。
-- **进程内联调**：`tests/integration.ts` 驱动真实 `tick()`（来自 `dispatch.ts`），用一个可控宿主桩覆盖 4 条关键路径——唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
+- **零依赖自检**：`tests/verify.ts` 的 44 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
+- **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，24 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
 ## 开发环境注意事项
 
@@ -240,6 +228,12 @@ node node_modules/typescript/bin/tsc --noEmit
 
 > **桌面版注意**：`~/.dsh` 桌面 App（如 `0.2.1-rc.3`）**没有 `dsh` CLI**，由 App 驱动，且已内置 `@deepseek-ai/dsh-experimental-agent-team-profile`（团队前置条件天然满足）。挂载方式是把本包加进 `~/.dsh/profiles/desktop/package.json` 的 `dependencies` 与 `dsh.profile.bundles`，在 profile 内 `pnpm install`（pnpm 由 runtime 自带、不在 PATH），再重启 App。下面的 CLI 命令仅适用于 CLI 版 dsh。
 
+桌面 profile 上有三个坑，都是实测撞过的：
+
+1. **用 runtime 自带的 pnpm**，不要 `corepack pnpm`（下的是另一个大版本，可能重写锁文件）：`node ~/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/pnpm/bin/pnpm.cjs install`。
+2. **新版本会被 `minimumReleaseAge` 拦住**：profile 启用了供应链策略，刚发布的版本落在 24 小时冷却窗口内。正确做法是在 `profiles/desktop/pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里加一行 `dsh-team-autopilot@<版本>`（版本级豁免，不动全局策略），而不是 `--config.minimumReleaseAge=0`。
+3. **换过包名后锁文件必须重解析**：`package.json` 改了依赖名、锁文件没跟着变时，旧条目（例如已下架的旧包）会让 pnpm 在解析**之前**就整体拒装，报错点名的是**旧包**而不是新版本——等满冷却期也不会好。修法是删掉锁文件里旧包名对应的 importer / `packages:` / `snapshots:` 三段，再 `pnpm install`；不要用 `pnpm clean --lockfile` 重建（会把所有依赖的 caret 范围重新解析）。
+
 ```bash
 # 1) 装宿主与团队 profile（版本对齐 0.2.1-rc.2）
 npm i -g @deepseek-ai/dsh@0.2.1-rc.2
@@ -247,7 +241,7 @@ dsh plugin --profile web add @deepseek-ai/dsh-experimental-agent-team-profile
 
 # 2) 叠上本插件（cordis.patch.yml 会自动插入 team-autopilot 一行）
 dsh plugin --profile web add dsh-team-autopilot
-# 未发布时改用本地 tarball：dsh plugin --profile web add ./dsh-team-autopilot-0.2.0.tgz
+# 未发布时改用本地 tarball：dsh plugin --profile web add ./dsh-team-autopilot-<版本>.tgz
 
 # 3) 先开 dryRun 观察判定（把 patch 里 config.dryRun 设为 true），再起宿主
 dsh web
@@ -259,14 +253,14 @@ dsh web
 
 - 一个 ready 且无 owner 的任务 + 一个 `inactive` 成员 → 下一轮 `team_autopilot_status` 应看到 `rounds` 递增、`dispatched` 递增、`breaker=closed`。
 - 一个写域与在飞任务重叠的 ready 任务 → `skipped` 增加且 `scope` 那一项跟着涨，且不产生唤醒。
-- 故意让 `sendMessage` 失败 → 连续 `errorThreshold` 次后 `breaker=open`、`trips≥1`；冷却期内 `blocked` 递增且不再派发。
+- 故意让 `sendMessage` 失败 → 连续 `errorThreshold` 次后 `breaker=open`、`trips≥1`；冷却期内 `held` 递增（`team_autopilot_status` 里叫 `breakerBlocked`）且不再派发。注意别和任务桶的 `blocked`（卡依赖）混了，两个词含义无关。
 - 关掉 `dryRun` 后，确认成员端实际 claim 时序，以及和官方 `wait_agent` 是否互相干扰。
 
 ## 真机验证记录
 
 在 DeepSeek Harness 桌面版 `0.2.1-rc.3` 上（`dryRun: true`）实测：
 
-- 写域冲突拦截：被跳过的任务计入 `skipped`（现在拆成 `scope` / `noMember` 两项；当时记作 `lastBlocked=1`）——task-2 被 in_progress 的 task-1 挡住
+- 写域冲突拦截：被跳过的任务计入 `skipped`（现在是 `scope` / `noMember` / `declined` 三项，当时只有 `lastBlocked=1`）——task-2 被 in_progress 的 task-1 挡住
 - 正路径派发：`dispatched=1`（task-3 派给 idle 成员）
 - 冷却去重：`suppressed=2`
 - 诊断：`team=session-… tasks=3 inFlight=1 claimable=2 idle=1 slots=1`
@@ -319,16 +313,16 @@ dsh web
 ```
 autopilot active
 totals rounds=N dispatched=N suppressed=N skipped=N unclaimed=N reclaimed=N
-caller team=<id> tasks=N inFlight=N claimable=N idle=N slots=N (live)
+caller team=<id> tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (live)
 teams=N
-  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N)
-  breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N
-  tasks=N inFlight=N claimable=N idle=N slots=N (<age>)
+  team=<id> ticks=N dispatched=N suppressed=N skipped=N (scope=N noMember=N declined=N) breaker=<state> trips=N held=N reclaimed=N unclaimed=N pending=N tasks=N inFlight=N claimable=N blocked=N done=N idle=N slots=N (<age>)
     lastReclaim task=<id> from=<member> reason='<cause>' applied|dry-run (<age>)
     lastDispatch task=<id> to=<member> wakes=N sent|dry-run outcome=claimed|unclaimed|unchecked (<age>)
 ```
 
-四类字段，各回答一类问题：
+团队行是**一整行**（上面为排版折过行，实际输出不分行）：`skipped` 后面的括号和 `breaker=` 都在同一行里，`grep 'breaker=open'` 才拿得到。
+
+四类字段，各回答一类问题（同一类里可能有多个键）：
 
 | 字段 | 回答什么 | 为什么必须有 |
 |---|---|---|
@@ -337,7 +331,7 @@ teams=N
 | `lastDispatch`（task / to / **wakes** / outcome / 时刻） | 派给谁了、叫了几次、有没有人接 | `dispatched=3` 看不出是 3 个任务各一次，还是 1 个任务叫了 3 次 |
 | `unclaimed` | 有多少次唤醒石沉大海 | 反复不接活的成员会一直占住派发通道，而这是插件当前**唯一**能让它显形的数字 |
 | `pending`（当前待判） | 现在有几条唤醒已发出、还没到判定时刻 | `lastDispatch` 只能记住一条；一轮唤醒两个任务时，第二个在 `outcome` 上完全看不见 |
-| `why`（`scope` / `noMember` / `declined` / `-`，**本轮**） | 这一轮为什么跳过 | 上面三个计数是累计的，任务没人接时每轮都在涨；`why` 只在原因变化时才变——所以它既安静又即时，「全员拒接、插件停手」这类事件不用等心跳 |
+| `why`（`scope` / `noMember` / `declined` / `-`，**本轮**）| 这一轮为什么跳过 | **只在日志行里**（status 工具没有这个字段，它的 `skipped (scope=…)` 是累计值）。它只在原因变化时才变，所以既安静又即时——「全员拒接、插件停手」这类事件不用等心跳 |
 
 `outcome` 的判定发生在**唤醒过了冷却窗口之后**，不是下一次读板就判：唤醒发出去的瞬间，成功与「没人接」在观测上完全相同，而成员读消息、调 `team_task_update` 需要时间。真机上变化驱动的轮次可能只隔 1 秒，那时判就等于在判成员的思考时间——曾因此把每一次唤醒都算成未认领、把正在认领的成员记进拒绝集合、把任务改派给同事造成重复劳动。冷却窗口是判定最早的合理时刻：任务在此之前本来也不允许改派给别人。
 
@@ -367,7 +361,7 @@ team-autopilot:
 只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记。累计跳过计数（`skip` / `scope` / `noMember` / `declined`）不参与比较——它们每轮都在涨，算作变化就等于逐轮写；本轮的原因 `why` 参与比较，所以「开始被写域挡住」「全员拒接后停手」仍会立刻写一行：
 
 ```
-2026-10-28T08:31:02.004Z autopilot-start version=0.3.2 tickMs=30000 wakeMs=60000 reclaimMs=60000 heartbeatMs=600000 dryRun=false
+2026-10-28T11:33:10.805Z autopilot-start version=0.3.5 tickMs=30000 wakeMs=60000 reclaimMs=60000 heartbeatMs=600000 dryRun=false
 2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 why=declined unclaimed=2 pending=0 reclaimed=0 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
 ```
 

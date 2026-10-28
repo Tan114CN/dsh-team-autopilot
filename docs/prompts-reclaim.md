@@ -9,56 +9,24 @@
 配置文件是 profile 的 patch 层，本机路径：
 
 ```
-C:/Users/Tan11/.dsh/profiles/desktop/cordis.patch.yml
+%USERPROFILE%/.dsh/profiles/desktop/cordis.patch.yml
 ```
 
-其中本插件那一段（第 34–36 行）要改成——**`id` 必须一起改**，服务 id 已从 `team-scheduler` 改为 `team-autopilot`，只改 config 不会命中：
+本插件那一段改成（`id` 必须是 `team-autopilot`——这是改包名后的服务 id，只改 `config` 不会命中）：
 
 ```yaml
 - id: team-autopilot
   config:
-    dryRun: true          # 第一轮保持 true
+    dryRun: true          # 第一轮保持 true，只验判定
     reclaimAfterMs: 60000
     reclaimOnFailed: true
 ```
 
-同时 `C:/Users/Tan11/.dsh/profiles/desktop/package.json` 第 30 行 `dsh.profile.bundles` 里的 `"dsh-team-scheduler"` 要改成 `"dsh-team-autopilot"`。
+改完**完全退出 App 再启动**。关窗口不算：`stalled` 表在内存里，不重启就还在用旧的 `reclaimAfterMs`。
 
-> **前提**：本机装的是旧包 `dsh-team-scheduler@0.1.2`，其 `dist` 里没有 reclaim，改配置无效。必须先按 [升级到新包](#升级到新包) 换包。
-
-改完**完全退出 App 再启动**（关窗口不算，stalled 表在内存里）。
-
-### 升级到新包
-
-`dsh-team-autopilot@0.2.0` 已发布到 npm。但仍建议手工放置，不跑包管理器（避免污染 profile 的 pnpm 布局，也避开 `minimumReleaseAge` 对新版本的拦截）：
-
-```bash
-# 0. 备份
-cd /c/Users/Tan11/.dsh/profiles/desktop
-cp package.json package.json.bak-reclaim
-cp cordis.patch.yml cordis.patch.yml.bak-reclaim
-
-# 1. 从 registry 拉已发布的包（--registry 必须显式指定：默认走 npmmirror 镜像）
-cd /c/Users/Tan11/AppData/Local/Temp && mkdir -p autopilot && cd autopilot
-npm pack dsh-team-autopilot@0.2.0 --registry=https://registry.npmjs.org
-tar -xzf dsh-team-autopilot-0.2.0.tgz
-
-# 2. 放进 profile（nodeLinker: hoisted，node_modules 就是普通目录）
-cd /c/Users/Tan11/.dsh/profiles/desktop/node_modules
-mv dsh-team-autopilot dsh-team-autopilot.old-0.1.2      # 留着回滚
-cp -r /c/Users/Tan11/AppData/Local/Temp/autopilot/package dsh-team-autopilot
-
-# 3. 自检（不需要重启）
-cd "E:/Workbuddy Project/dsh-team-scheduler" && npm run verify:mount
-```
-
-同时 profile 的 `package.json` 依赖要写成 `^0.2.0`，`pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 要列 `dsh-team-autopilot@0.2.0`（否则以后跑 pnpm install 会被「发布太新」拦住）。
-
-旧目录 `node_modules/dsh-team-scheduler` **先留着**，等验证通过再清。
-
-**回滚**：把两个 `.bak-reclaim` 复制回去即可；`node_modules/dsh-team-autopilot` 不被 bundles 引用就不会加载。
-
-**确认换了新包**：在 Harness 里调 `team_autopilot_status`，首行是 `autopilot active` 即新版（旧版输出 `scheduler active`）。
+> **版本前提**：`reclaim` 以及本文反复用到的 `lastReclaim` / `pending` 字段需要 `0.3.5` 及以上。确认方式是看 `statusFile` 的启动行（`grep autopilot-start | tail -1`），或直接调 `team_autopilot_status` 看首行是不是 `autopilot active`。
+>
+> **装版本走包管理器，不要手工往 `node_modules` 塞解包目录**：手放的副本不会进 `package.json` 与锁文件，下次 `pnpm install` 直接覆盖掉，还会让 `verify-mount` 的 lockfile 一项长期红灯。命令与两个已知坑见 README「安装」与「真实宿主联调」。
 
 ---
 
@@ -195,7 +163,7 @@ cd "E:/Workbuddy Project/dsh-team-scheduler" && npm run verify:mount
 | `reclaimed` 一直是 0，任务 owner 是空的 | 任务没被认领 → 不算 in-flight，本来就无需回收。让 worker-a 真的认领 |
 | `reclaimed` 涨了但任务没变 | 这是 dryRun 的正常表现，不是失败 |
 | `reclaimed` 涨了但 `lastError` 出现 | reassign 被拒（多半是 revision 冲突），把错误贴出来 |
-| 等了两分钟还没动静 | 确认 App 是**完全退出后重启**的；确认配置键是 `team-autopilot`（改名后不是 `team-scheduler`） |
+| 等了两分钟还没动静 | 确认 App 是**完全退出后重启**的；确认 patch 里的段 id 是 `team-autopilot`，且 `reclaimAfterMs` 确实生效（对照启动行） |
 | worker-a 不肯停手 | spawn 时的 prompt 没生效，重新 spawn 一个，或直接在消息里再强调一次规则 |
 | 插件没加载 | 跑 `node scripts/verify-mount.mjs` |
 

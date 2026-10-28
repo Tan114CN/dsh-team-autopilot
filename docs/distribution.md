@@ -89,7 +89,7 @@ description:
 | `package.json` 声明 `dsh.bundle` | ✅ `{"bundle":{"patch":"./cordis.patch.yml"}}` |
 | `cordis.patch.yml` 存在于仓库根 | ✅ |
 | 发布的包 `repository` 指回本仓库 | ✅ `git+https://github.com/Tan114CN/dsh-team-autopilot.git` |
-| 真实可用代码、非占位 | ✅ 44 项 verify + 22 项 integration 全绿 |
+| 真实可用代码、非占位 | ✅ 44 项 verify + 24 项 integration + 28 项验收全绿 |
 | 仓库年龄 ≥ 1 天 | ⏳ 北京时间 10-29 02:17 起满足 |
 | 已加 `dsh-plugin` topic | ⏳ 动作 1 |
 
@@ -112,7 +112,7 @@ description:
 | 任务就绪且无主时才派 | `src/select.ts` 的 `claimableTasks` + `availableMembers` |
 | 唤醒空闲成员 | `src/dispatch.ts` 派发段；冷却 `wakeCooldownMs` 默认 60s |
 | 收回停摆者的任务 | `src/reclaim.ts` 的 `planReclaim`；`reclaimAfterMs` 默认 300s |
-| 写域重叠在派发时刻拦掉 | `src/select.ts` 第 331 行 `kind: 'scope'`，`writeScopes` 按 `/` 分段前缀比对 |
+| 写域重叠在派发时刻拦掉 | `src/select.ts` 的 `blocked.push({ kind: 'scope' })`，`writeScopes` 按 `/` 分段前缀比对 |
 | 「不另造团队层」 | 无自有任务存储、成员注册表或消息通道；任务板与 roster 全部经 `ctx.agentTeams` 读写 |
 
 表里每一条主张都能指到具体位置，没有一条是形容词。**描述里不要出现的**：星数、下载量、用户数、任何数量词（「9 个模块」这种也别说——评审会数）。

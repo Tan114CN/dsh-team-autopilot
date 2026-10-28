@@ -5,6 +5,23 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 文档
+
+- **README 与 `docs/` 全量对账**（`0.3.5` 发布后逐份核到代码），修正三类问题：样例输出与真实格式不一致、字段说明张冠李戴、版本前提与失效链接。三处最影响阅读的：
+  - README 的 status 样例把**一整行**的团队行排成了三行，照它 `grep 'breaker=open'` 永远 grep 不到；`caller` 行还缺 `blocked=` / `done=`。
+  - `why` 被列进「status 字段」表，但它**只在日志行**里；而真正在 status 里的 `pending` 反倒漏了速查表。
+  - `docs/prompts-dispatch.md` 声称「`idle` 可能包含 Lead 自己」。`availableMembers()` 只取 `role === 'teammate' && status === 'inactive'`，**Lead 永远不在派发候选里**，`idle` 也不含它；连带「一个成员都没有时任务不会派出去」也写清楚（`noMember` 上涨）。
+- 断言数订正：`verify` 42 → **44**、`integration` 16 → **24**（README、`docs/distribution.md` 及各处的「有 21 项断言」「覆盖 4 条关键路径」同步改掉）。
+- `docs/prompts-reclaim.md` 删掉整段「旧包迁移 + 手工把解包目录塞进 `node_modules`」的过时流程——改名与升级早已完成，手放的副本不进 `package.json` 与锁文件、下次 `pnpm install` 就被覆盖，现在改为版本前提 + 走包管理器的指引。
+- `docs/verify-host.md`：回滚段落原本让人 `cp *.bak-20261027-233651`，那批备份已清理，且锁文件备份本身可能正是问题源头；改为 `pnpm add dsh-team-autopilot@<版本>`，并补「只想停掉插件就把 `enabled` 设 false」。另补一句：一旦离开首次安全模式，`first-run dryRun === true` 这一项**会一直 FAIL**，属预期不是故障。
+- `docs/verify-multiteam.md` 去掉「验证 `0.1.2` 修复」的一次性框架，改为可反复执行的回归手册（回归触发点写明：改动主循环或 Lead 解析时重跑）。
+- `docs/verify-reclaim.md` 的 `outcome` 取值补 `unchecked`，并说明它表示「还没到判定时刻」而非「没人认领」。
+- `docs/team-collab-task.md` 标注已被 v2 取代，并写明原因（v1 让成员主动认领，抢在调度器前面把活干完，`[team-autopilot]` 0 次）。
+- README 新增「桌面 profile 的三个坑」：用 runtime 自带 pnpm（`corepack pnpm` 是另一个大版本）、`minimumReleaseAgeExclude` 做版本级豁免而非关掉全局策略、换包名后锁文件必须重解析（残留旧条目会让 pnpm 在解析**之前**整体拒装，报错点名的是旧包，等满冷却期也不会好）。
+- `dsh-agent-dispatch` 引用处理：该包已从 registry 下架（`npm view` 返回 404），README 里以它为样本的 `inject` / 工具名 / channels 默认值等逐字段断言无法复现，压缩为类别级结论并标注引用变化；「可以叠加」的判据改成看它写哪套状态。
+
 ## [0.3.5] - 2026-10-28
 
 ### 新增
