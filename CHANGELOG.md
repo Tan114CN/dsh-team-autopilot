@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 文档
+
+- `docs/distribution.md` 的「现状」表把 `GitHub topics` 写成**空数组**、`description` 写成 **null**，而这两项 2026-10-28 已写入。分发是当前唯一的瓶颈，一份把自己已完成的动作记成待做的清单，会让下一个读者重复做一遍、或在错前提上判断。动作 1 标为已完成，门槛表里只剩**仓库年龄**一项未满足（`created_at=2026-10-27T18:17:09Z`，北京时间 10-29 02:17 达标）。
+- README 的「先挂 waiter，再读状态」原先只写「`waitForChange` 内部是一个 `Map<TeamId, Set<Waiter>>`」，读的人无从核实。现在点名到官方 `TeamActivity.waiters`——`lib/index.js` 里 `new Map()` 配 `new Set()`，装完依赖就能看一眼。
+- README 的「不做独立工作目录」补全了参数来源：工具 schema 只有 `name` / `description` / `prompt` / `context` 四个参数，服务层 `SpawnTeammateRequest` 另有 `provider` 与 `signal`，但 `provider` 由 profile 配置按 `context` 选（`forkProvider` / `freshProvider`）、`signal` 由宿主注入，两者都不是调用方能指定的。这条正好加固「不做 per-member model」的边界论证——`agentOptions` 不在任何一层。
+- README 的「官方另有 9 个团队工具」补出枚举（`spawn_teammate` / `send_message` / `wait_agent` / `interrupt_agent` / `list_agents` 加 4 个 `team_task_*`），可在应用包内逐名核对。
+- 「类型对账通过」原写「代码按 rc.3 源码结构编写，类型来自 `0.2.1-rc.2`」，两个 rc 混在一句里、读者会以为依赖了 rc.3。改为：devDependency 钉 `rc.2` 作对账基准，peer 范围 `>=0.2.1-rc.2 <0.3.0` 会接受后续 rc（上游 `next` 现为 `rc.4`），但没逐个复核，升级时重跑 `tsc` 与 `npm test`。
+
 ## [0.3.6] - 2026-10-28
 
 ### 新增

@@ -12,12 +12,16 @@ dsh 生态的插件发现**不是靠人传人，是靠一份目录数据**：
 | 其中带 npm 映射（能显示下载量、按包名安装） | 3823 | 同上，`npm` 字段非空 |
 | 我们所在的 `workflow` 分类条目数 | 413 | 同上次级统计 |
 | `dsh-team-autopilot` 是否在其中 | **否** | 全文检索无命中 |
-| GitHub `topics` | **空数组** | GitHub API |
-| GitHub `description` | **null** | GitHub API |
+| GitHub `topics` | **8 个已设**（含 `dsh-plugin`） | GitHub API，2026-10-28 复核 |
+| GitHub `description` | **已填**（首句 `Deterministic auto-dispatch for …`） | 同上 |
 
-这份 `plugins.json` 是 `dshmarket`、`dsh-m`、`dsh-community-plugins` 等**应用内市场**的数据源；`dshhub.dev` 之类目录站则按 GitHub 的 `dsh-plugin` topic 每日爬取。两条路我们都还没上路。
+> 前三行是 2026-10-28 的目录快照，后两行是同日复核的仓库元信息——**动作 1 已完成**，表里不再留白。目录那两行（条目总数、npm 映射数）会随别人投稿变化，引用时以当次抓取为准。
 
-结论：现在的问题不是「描述写得不够好」，而是**在索引里不存在**。一个不存在的东西，文案好坏没有意义。
+这份 `plugins.json` 是 `dshmarket`、`dsh-m`、`dsh-community-plugins` 等**应用内市场**的数据源；`dshhub.dev` 之类目录站则按 GitHub 的 `dsh-plugin` topic 每日爬取。
+
+两条路的进度不一样：**topic 那条已经铺好**（8 个 topic 已加，按 topic 爬的目录站会自己发现我们，不需要再做什么），**应用内市场那条还完全没上**——`plugins.json` 只能由投稿进入，也就是下面动作 2 要开的那个 PR。两者不能互相替代：进了应用内市场才有一键安装。
+
+结论：现在的问题不是「描述写得不够好」，而是**在应用内市场那份索引里不存在**——`dsh-plugin` topic 只让按 topic 爬的目录站看见我们，进不了 `plugins.json`。一个不存在的条目，文案好坏没有意义。
 
 ## 二、竞争位：目录里确实空着
 
@@ -33,9 +37,11 @@ dsh 生态的插件发现**不是靠人传人，是靠一份目录数据**：
 
 ## 三、三个动作
 
-### 动作 1：仓库元信息（现在就能做，两分钟）
+### 动作 1：仓库元信息（✅ 已完成 2026-10-28）
 
 这两项是**所有自动收录的前提**：`dsh-plugin` topic 是 awesome 列表的硬性收录条件，也是目录站每日爬取的信号。
+
+已完成：`description` 与 8 个 topic 都已写入（`curl api.github.com/repos/Tan114CN/dsh-team-autopilot` 可复核）。以下值留作存档，将来改描述时以这里为准：
 
 打开 <https://github.com/Tan114CN/dsh-team-autopilot> → 右侧 About 旁的齿轮：
 
@@ -90,8 +96,8 @@ description:
 | `cordis.patch.yml` 存在于仓库根 | ✅ |
 | 发布的包 `repository` 指回本仓库 | ✅ `git+https://github.com/Tan114CN/dsh-team-autopilot.git` |
 | 真实可用代码、非占位 | ✅ 45 项 verify + 24 项 integration + 28 项验收全绿 |
-| 仓库年龄 ≥ 1 天 | ⏳ 北京时间 10-29 02:17 起满足 |
-| 已加 `dsh-plugin` topic | ⏳ 动作 1 |
+| 仓库年龄 ≥ 1 天 | ⏳ **唯一未满足项**：`created_at=2026-10-27T18:17:09Z`，北京时间 10-29 02:17 起达标 |
+| 已加 `dsh-plugin` topic | ✅ 8 个已设（2026-10-28 复核） |
 
 **不要**在 yml 里手写 `npm:` 字段——会被校验拒绝；npm 映射由 registry 按 `repository` 自动采集。
 
@@ -128,7 +134,7 @@ description:
 
 按项目记忆里的止损条件，三个月后 GitHub 仍 0 star 就说明问题在分发而不在功能。所以：
 
-1. **动作 1 是唯一的单点**——topic 一加，目录站的每日爬取就开始工作，其余路径都建立在它上面
+1. **动作 1 已完成**——topic 一加，目录站的每日爬取就开始工作，其余路径都建立在它上面。现在唯一的单点是**动作 2 的仓库年龄门槛**（北京时间 10-29 02:17），到点前没有任何可提前做的准备
 2. 动作 2 让插件出现在应用内市场，用户能一键装，这是从「搜到」到「用上」的关键一跳
 3. 文案、截图、英文 README 都是**转化**层面的优化，在这两件事完成前没有作用对象
 

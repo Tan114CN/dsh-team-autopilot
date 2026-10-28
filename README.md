@@ -78,7 +78,7 @@ dsh 生态里做多智能体协作的插件有十几款，但真正的分水岭�
 
 它同样有真调度器。加了回收之后冲突更具体：同一个僵死任务，我们**回池**（`reassign` 不带 owner → 无主 `pending`），它**换人**（`reassign_task` 指定新 owner）。两套状态源互不认（它读自建存储，我们读原生 `ctx.agentTeams`），谁也看不见对方已经动过手。
 
-附带一个认知负担：它会注册 14 个 `agent_teams_*` 工具，官方另有 9 个团队工具，23 个名字相近的工具摆在同一只模型面前，调错概率不低。
+附带一个认知负担：它会注册 14 个 `agent_teams_*` 工具，官方另有 9 个团队工具（`spawn_teammate` / `send_message` / `wait_agent` / `interrupt_agent` / `list_agents` 加 4 个 `team_task_*`），23 个名字相近的工具摆在同一只模型面前，调错概率不低。
 
 ### 安装顺序
 
@@ -140,7 +140,7 @@ dsh plugin --profile web add dsh-team-autopilot
 `updateTask` 的 `claim` 动作留给成员自己走 `list → get → claim` 流程。调度器代认领会和成员争抢所有权，而 CAS 冲突只会让成员白跑一轮。代价是多一次往返，换来的是所有权语义干净。唤醒消息把任务 title 当**数据**处理（折叠空白、按码点截断、中和反引号），避免任务标题被当成跨 agent 的指令注入。
 
 **2. 先挂 waiter，再读状态。**  
-`waitForChange` 内部只是一个 `Map<TeamId, Set<Waiter>>`，**没有任何历史缓冲**——注册之前发生的边沿永久丢失。所以顺序必须是「先 `waitForChange`，后全量 `listTasks`」，否则会漏掉窗口期内的变化。
+`waitForChange` 落到官方的 `TeamActivity.waiters` 上——就是一个 `Map<TeamId, Set<Waiter>>`（`lib/index.js` 里 `new Map()` 配 `new Set()`，可直接复核），**没有任何历史缓冲**——注册之前发生的边沿永久丢失。所以顺序必须是「先 `waitForChange`，后全量 `listTasks`」，否则会漏掉窗口期内的变化。
 
 **3. 每轮重新解析 Lead（多团队各派各的）。**  
 `waitForChange` / `listTasks` / `sendMessage` 都要求一个 **live** Agent 当凭证。Lead 实例在会话重组后会被替换，缓存引用会失效。所以每轮都走 `ctx.agents.roots()` + `tryMembership()` 重新找——而且**遍历所有 Lead**，不是取第一个。桌面宿主会同时开着多个会话，每个会话就是一个独立 Team；若只取第一个 Lead，调度器会永远绑定最早注册的那个团队、静默忽略其余。现在主循环为每个 Lead 各跑一轮 `tick`，`lastWake`（冷却去重）和 `breaker`（熔断）都按 `TeamId` 拆分，团队之间互不干扰。
@@ -200,7 +200,7 @@ node scripts/verify-pack.mjs                    # → 7 required files, 0 forbid
 >
 > `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
-- **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
+- **类型对账通过**：`devDependencies` 钉住 `0.2.1-rc.2`，代码逐条对过它的 `.d.ts`；`peerDependencies` 写的是范围 `>=0.2.1-rc.2 <0.3.0`，会自动接受后续 rc（上游现在 `next` 是 `0.2.1-rc.4`），但没有逐个 rc 复核过——升级 rc 时请重跑 `tsc` 与 `npm test`。
 - **零依赖自检**：`tests/verify.ts` 的 45 项断言覆盖纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）与输出格式（日志行、状态签名、启动标记）。`select.ts` / `breaker.ts` / `observe.ts` 只有 `import type` 或无外部依赖，所以这个脚本不需要任何 `node_modules` 也能跑。
 - **进程内联调**：`tests/integration.ts` 用可控宿主桩驱动真实 `tick()` 与 `loop()`，24 项断言覆盖唤醒空闲成员、写域冲突拦截、连续失败触发熔断、`TeamId` 级预算覆盖，以及三条容易「看起来对但其实没生效」的时序/写入规则——每团队每 interval 只 tick 一次、唤醒判定不早于冷却到期、只有累计计数变化的轮次不写日志。`dispatch.ts` 不 import `dsh-tools`，所以同样零 `node_modules` 可跑。
 
@@ -397,7 +397,7 @@ grep 'autopilot-start' team-autopilot.log       # 每次重启：哪个版本、
 ## 边界
 
 - 不修改原生状态机，不用内部符号，不写自定义 SessionEvent，不写自定义 projection
-- 不做独立工作目录：Team 层的 `spawn_teammate` 只接受 `name` / `description` / `prompt` / `context`，**不转发 `cwd`**。subagent 层的 spawn request 确实有 `cwd`，但走 subagent 就脱离 Team roster，既收不到 Team 消息也碰不到任务板。官方 `dsh-experimental-worktree` 已落地，文件隔离等官方即可
+- 不做独立工作目录：Team 层的 `spawn_teammate` 工具 schema 只有 `name` / `description` / `prompt` / `context` 四个参数（`context` 取 `fresh` / `fork`），**没有 `cwd`**。服务层的 `SpawnTeammateRequest` 另有 `provider` 与 `signal`，但两者都不是调用方能给的——`provider` 由 profile 配置按 `context` 选（`forkProvider` / `freshProvider`），`signal` 是宿主注入的取消信号。subagent 层的 spawn request 确实有 `cwd`，但走 subagent 就脱离 Team roster，既收不到 Team 消息也碰不到任务板。官方 `dsh-experimental-worktree` 已落地，文件隔离等官方即可
 - 不做成员自治（原生 Explicit authority：只有 Lead 能 spawn / interrupt）
 - **不做 per-member model**：底层 `dsh-subagent` 的 spawn request 支持 `agentOptions.model` / `provider` / `reasoningEffort`，但 Team 层没转发这个参数。想实现只剩两条脏路——monkey-patch `ctx.agentTeams.spawnTeammate`，或绕开 Team 层自建（产物不是 teammate）。两条都破坏上面第一条边界，且上游隔天一版、碎掉只是时间问题。等官方开口子再做
 - **尚未做**（都是官方书面声明的空档，但本插件当前未实现）：**投递确认**与**团队 token 预算闸**。注意现有的 `maxConcurrent` / `teamBudgets` 是**并发**预算，不是花钱预算。
