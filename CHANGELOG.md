@@ -49,6 +49,13 @@
 - 新增「官方会不会把这些做了」：引用 `goal-round-driver` 三句书面声明（编排 / 资源预算 / 异常重试均划归插件层），并附 `experimental-agent-team` 中 `dispatch` / `autoAssign` 命中 0 文件的核验结果。
 - 边界一节补两条：**不做 per-member model** 的三层事实（subagent 层支持 `agentOptions.model`，Team 层未转发）、**尚未做** 三项（僵死回收 / 投递重试 / token 预算闸）及各自对应的官方书面依据。
 
+### 工程
+
+- 版本号 0.1.2 → **0.2.0**；删除调试残留 `schema-probe.mjs` 与 0.1.2 tarball；`.gitignore` 新增 `*.tgz`（`npm pack` 产物永不入库）。
+- **发布门禁补漏**：`scripts/verify-status.mjs` 此前既不在 `npm test` 也不在 `prepublishOnly` 里，而它是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 被宿主拒绝时工具会**静默失效**（不报错、不派发），只有它能提前拦住。现已接入 `npm test` 与 `prepublishOnly`。
+  - 修正脚本内一条错误断言（`caller.slots` 期望 2，实际应为 1：预算 2 减去 1 个在飞任务）。
+  - 补上**热状态**用例：冷启动调用永远走不到 `lastReclaim` / `lastDispatch` 这两个嵌套对象，之前等于本次新加的嵌套 schema 完全没被校验。现已确认真实编译器接受（`validateJsonSchemaValue` 零问题）。
+
 ## [0.1.2] - 2026-10-28
 
 ### 修复

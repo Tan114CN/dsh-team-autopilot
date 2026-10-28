@@ -113,7 +113,9 @@ assert.equal(result.caller.tasks, 1)
 assert.equal(result.caller.inFlight, 1)
 assert.equal(result.caller.claimable, 0)
 assert.equal(result.caller.idle, 0)
-assert.equal(result.caller.slots, 2)
+// One slot is taken by the in-flight task, one is left out of the default
+// `maxConcurrent` of 2.
+assert.equal(result.caller.slots, 1)
 
 // --- Check the rendered text ----------------------------------------------
 
@@ -143,6 +145,57 @@ assert.equal(outsider.caller, undefined)
 const outsiderProblems = validateJsonSchemaValue(definition.output.schema, outsider, '')
 assert.deepEqual(outsiderProblems, [], 'the report must stay valid without a caller team')
 assert.match(definition.output.render({}, outsider).map(b => b.text ?? '').join('\n'), /teams=0/)
+
+// --- The nested decision records must validate too -----------------------
+//
+// `lastReclaim` / `lastDispatch` are nested objects declared with
+// `additionalProperties: false`. They only appear after the first reclaim or
+// dispatch, so every check above — which runs against a cold state — never
+// exercises them. A nested schema the host's compiler rejects would therefore
+// surface only in production, long after the install that introduced it.
+const warm = {
+  ...result,
+  teams: [{
+    team: TEAM,
+    ticks: 3,
+    dispatched: 2,
+    suppressed: 1,
+    skipped: 0,
+    skippedScope: 0,
+    skippedNoMember: 0,
+    unclaimed: 1,
+    breaker: 'closed',
+    breakerTrips: 0,
+    breakerBlocked: 0,
+    reclaimed: 1,
+    tasks: 1,
+    inFlight: 1,
+    claimable: 0,
+    idle: 0,
+    slots: 1,
+    lastTickAt: 1_000,
+    lastReclaim: {
+      taskId: 'task-1',
+      reason: 'owner "worker-x" inactive for 60012ms',
+      previousOwner: 'worker-x',
+      at: 2_000,
+      applied: true,
+    },
+    lastDispatch: {
+      taskId: 'task-1',
+      memberName: 'worker-x',
+      at: 2_500,
+      repeats: 2,
+      sent: true,
+      claimed: false,
+    },
+  }],
+}
+const warmProblems = validateJsonSchemaValue(definition.output.schema, warm, '')
+assert.deepEqual(warmProblems, [], `nested decision records must validate: ${warmProblems.join('; ')}`)
+const warmText = definition.output.render({}, warm).map(b => b.text ?? '').join('\n')
+assert.match(warmText, /lastReclaim task=task-1 from=worker-x reason='owner "worker-x" inactive for 60012ms' applied/)
+assert.match(warmText, /lastDispatch task=task-1 to=worker-x wakes=2 sent outcome=unclaimed/)
 
 console.log('PASS  status tool registers, validates, and renders')
 console.log('--- rendered output ---')

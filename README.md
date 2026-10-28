@@ -198,10 +198,13 @@ node node_modules/typescript/bin/tsc --noEmit   # → 零错误
 node tests/verify.ts                            # → OK — 39 checks passed
 node tests/integration.ts                       # → OK — 13 integration checks passed
 node scripts/acceptance.mjs                     # → OK — 28 acceptance checks passed
+node scripts/verify-status.mjs                  # → PASS（用真实 dsh-tools 编译器校验输出 schema）
 node scripts/verify-pack.mjs                    # → 7 required files, 0 forbidden, 0 dangling
 ```
 
-> `npm test` = `verify` + `integration` + `acceptance` 三套聚合；`npm run acceptance` 单独跑端到端验收。
+> `npm test` = `verify` + `integration` + `acceptance` + **`verify:status`** 四套聚合；`npm run acceptance` 单独跑端到端验收。
+>
+> `verify:status` 是唯一用**真实 `dsh-tools` schema 编译器**校验 `team_autopilot_status` 输出的脚本——输出 schema 若被宿主拒绝，工具会在安装后静默失效（不报错、不派发），只有这一项能提前拦住。它同时覆盖冷启动（无团队）与热状态（带 `lastReclaim` / `lastDispatch` 嵌套对象，冷启动永远不会走到）两种形态。已接进 `prepublishOnly`，发布前必跑。
 
 - **类型对账通过**：代码按 rc.3 源码结构编写，类型来自 npm 上的 `0.2.1-rc.2`，两者完全兼容，无 API 偏差。
 - **零依赖自检**：纯函数核心（选任务、选成员、写域冲突、并发预算、同轮去重、熔断状态机）有 21 项断言覆盖。`select.ts` / `breaker.ts` 只有 `import type` 或无外部依赖，所以 `node tests/verify.ts` 不需要任何 `node_modules` 也能跑。

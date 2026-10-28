@@ -40,4 +40,9 @@ jobs:
 
       - run: node scripts/acceptance.mjs
 
+      # Validates the status tool's output schema against the real
+      # dsh-tools compiler; a schema the host rejects fails silently at
+      # runtime, so this is the only guard that catches it.
+      - run: node scripts/verify-status.mjs
+
       - run: node scripts/verify-pack.mjs
