@@ -68,6 +68,7 @@ autopilot
 url: https://github.com/Tan114CN/dsh-team-autopilot
 name: Tan114CN/dsh-team-autopilot
 category: workflow
+icon: https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/icon-180.png
 description:
   en: 'Deterministic auto-dispatch on the native Agent Teams seam, with no team layer of its own: a background tick wakes an idle member for each ready unowned task, reclaims tasks whose owner went quiet, and treats overlapping write scopes as a soft lock at dispatch.'
   zh: 在原生 Agent Teams 接缝上做确定性自动派发，不另造团队层：后台 tick 为每个就绪且无主的任务唤醒空闲成员，收回持有者已停摆的任务，并把写域重叠在派发时刻当作软锁处理。
@@ -131,12 +132,22 @@ description:
 2. 动作 2 让插件出现在应用内市场，用户能一键装，这是从「搜到」到「用上」的关键一跳
 3. 文案、截图、英文 README 都是**转化**层面的优化，在这两件事完成前没有作用对象
 
-## 七、可选：市场卡片图标
+## 七、市场卡片视觉（已做）
 
-目录支持条目声明 `icon`（GitHub 托管的 png/jpg/webp，约 96px 方块，不接受 SVG），不写则回退到作者头像。在 413 条同分类条目里，一个有辨识度的方块会比默认头像更容易被点开。做法是在仓库 `assets/` 放一张图，然后在 yml 里加：
+条目里能声明两种图，都在**自己仓库里**声明，推自己的仓库就生效，不用再提 PR：
 
-```yaml
-icon: https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/icon-180.png
-```
+| 图 | 声明方式 | 规格 |
+| --- | --- | --- |
+| 卡片图标 | 条目 yml 的 `icon:` | GitHub 托管的 png/jpg/webp，约 96px 显示，方形最佳；**不收 SVG 与第三方图床** |
+| 详情页截图 | 仓库根的 `screenshots.json` | 1–8 个相对路径，相对该文件本身，不能以 `/` 开头、不能含 `..`；也接受 GitHub 托管的 https 绝对地址 |
 
-这一项是纯装饰，不影响收录，做完动作 1、2 再说。
+本仓库已有：
+
+- `assets/icon-180.png` — 一个成员从 roster 里接下任务
+- `assets/how-it-works.png` — 左右对照卡片；右侧时间线与底部三行字段是**真机日志原值**（`09:52:16.504` → `09:52:18.481`），不是示意
+- `screenshots.json` — 指向上面那张卡片图
+- `scripts/render-assets.py` — 生成这两张图的脚本（需要 Pillow：`python -m pip install pillow`）
+
+为什么把数字钉在真机字段上：这是整个仓库里唯一一张会脱离代码被传播的东西。市场卡片上编出来的时间线，是唯一无法被任何人核对的主张——而那正是这个项目最不该做的事。
+
+`assets/` 不在 npm 的 `files` 白名单里，所以 README 用 `raw.githubusercontent.com` 的绝对地址引图，npm 页面和 GitHub 都能渲染。要换图就改脚本重跑，别直接编辑 PNG。

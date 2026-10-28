@@ -2,6 +2,10 @@
 
 **Deterministic auto-dispatch for the native Agent Teams seam (`ctx.agentTeams`).**
 
+![左边是原生 Agent Teams：任务 ready、两个成员空闲，但没有人被叫醒。右边是同一块板子在插件下一轮的观测：任务出现、唤醒 worker-c、被认领、完成，全程 4 秒，路径中没有任何模型调用。](https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/how-it-works.png)
+
+上图的右侧不是示意：底部三行是 2026-10-28 真机日志的原样字段，可对照 [真机验证记录](#真机验证记录)。图由 `scripts/render-assets.py` 从这些字段渲染，不是手绘。
+
 官方 Agent Teams 给你 roster、任务板和 mailbox；本插件让这套东西自己转起来：任务 ready 且无主时，由一个后台 tick 唤醒空闲成员；持有者停摆时把任务收回池子；并把 advisory 的 `writeScopes` 重叠警告升级为**派发时刻的有效软锁**。
 
 它**不建第二个团队层**——没有自己的任务存储、成员注册表或消息通道，卸载即失效、不留残留状态。
