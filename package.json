@@ -1,7 +1,7 @@
 {
-  "name": "dsh-team-scheduler",
-  "version": "0.1.2",
-  "description": "Auto-dispatch scheduler for DeepSeek Harness Agent Teams: wakes idle members when a task becomes ready, and turns advisory write scopes into an effective soft lock.",
+  "name": "dsh-team-autopilot",
+  "version": "0.2.0",
+  "description": "Deterministic auto-dispatch for native DeepSeek Harness Agent Teams: wakes idle members when a task becomes ready, and turns advisory write scopes into an effective soft lock.",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -9,16 +9,16 @@
     "cordis-plugin",
     "dsh-plugin",
     "agent-teams",
-    "scheduler",
+    "autopilot",
     "orchestration"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tan114CN/dsh-team-scheduler.git"
+    "url": "git+https://github.com/Tan114CN/dsh-team-autopilot.git"
   },
-  "homepage": "https://github.com/Tan114CN/dsh-team-scheduler#readme",
+  "homepage": "https://github.com/Tan114CN/dsh-team-autopilot#readme",
   "bugs": {
-    "url": "https://github.com/Tan114CN/dsh-team-scheduler/issues"
+    "url": "https://github.com/Tan114CN/dsh-team-autopilot/issues"
   },
   "type": "module",
   "main": "dist/index.mjs",

@@ -4,6 +4,8 @@ dist/
 coverage/
 *.log
 *.tsbuildinfo
+# `npm pack` 的产物，永远不该进仓库（发布走 npm publish，tarball 只是本地自检用）
+*.tgz
 .DS_Store
 Thumbs.db
 .workbuddy/

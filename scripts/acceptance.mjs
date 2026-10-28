@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-team-scheduler 端到端验收脚本（自包含，零额外依赖）。
+ * dsh-team-autopilot 端到端验收脚本（自包含，零额外依赖）。
  *
  * 直接驱动 src/select.ts 的纯函数，串起一个最小但完整的调度场景：
  *   ┌─ 任务板（虚拟）──┐        ┌─ 决策核心 ────────────────┐
@@ -60,7 +60,7 @@ function member(name, role = 'teammate', status = 'inactive') {
 const W = (over) => task({ status: 'in_progress', ownerName: 'lead', ...over })
 
 console.log('='.repeat(60))
-console.log('dsh-team-scheduler 端到端验收')
+console.log('dsh-team-autopilot 端到端验收')
 console.log('='.repeat(60))
 console.log('')
 

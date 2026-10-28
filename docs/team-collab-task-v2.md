@@ -1,7 +1,7 @@
 # 开发任务 v2 · 真正触发「调度器自动派发」
 
 > 目的：v1 实测发现，成员若被 spawn prompt 告知「主动认领」，会抢在调度器之前把活干完，
-> 导致观察不到调度器本身。本版把成员改成「**被动等待**」，让 `team-scheduler` 成为唯一派发来源，
+> 导致观察不到调度器本身。本版把成员改成「**被动等待**」，让 `team-autopilot` 成为唯一派发来源，
 > 从而验证派发链路 + 熔断 + wait_agent 共存。
 
 ---
@@ -40,7 +40,7 @@
 
 成员分工（用 spawn 各建一个 teammate，prompt 一律用「被动等待」模式）：
 每个成员的 prompt 都写成：
-「原地待命，不要主动去 team_task_list 认领任务。等收到以 [team-scheduler] 开头的消息后，
+「原地待命，不要主动去 team_task_list 认领任务。等收到以 [team-autopilot] 开头的消息后，
  按消息里的 task id 用 team_task_update（action=claim，expected_revision 用消息里给的 revision）认领，
  只写自己负责的文件，完成后用 team_task_update（action=complete）标记，再 send_message 向 lead 汇报。」
 
@@ -61,18 +61,18 @@
 ## 四、观察清单（这次真正要看的东西）
 
 ### A. 调度器派发（核心）
-- 建完任务后，**等 30 秒**，然后调 `team_scheduler_status`：
+- 建完任务后，**等 30 秒**，然后调 `team_autopilot_status`：
   - `dispatched` 应该 **> 0**（任务被派给空闲成员）
   - `claimable` 从 4 递减
   - `idle` 对应变化
-- 成员会话里应出现 **`[team-scheduler] Task ...`** 唤醒消息（这是 v1 没看到的）
+- 成员会话里应出现 **`[team-autopilot] Task ...`** 唤醒消息（这是 v1 没看到的）
 
 ### B. 熔断（待验证）
 - 正常跑全程，`breaker` 应一直 `closed`、无 `lastError`
 - **这次不要故意搞挂成员**，先确认正常路径
 
 ### C. wait_agent 共存（待验证）
-- 看成员收到的消息：是只有 `[team-scheduler]` 一条，还是官方 `wait_agent` 也发了
+- 看成员收到的消息：是只有 `[team-autopilot]` 一条，还是官方 `wait_agent` 也发了
 - 重点：同一任务有没有被「两个机制」重复派给两个成员
 
 ---
@@ -80,10 +80,10 @@
 ## 五、记录模板（跑完贴回）
 
 ```
-[任务开始时] team_scheduler_status = ...
-[30秒后] team_scheduler_status = ...（重点看 dispatched 是否 >0）
+[任务开始时] team_autopilot_status = ...
+[30秒后] team_autopilot_status = ...（重点看 dispatched 是否 >0）
 [成员会话] 收到的第一条唤醒消息原文 = ...
-[任务结束] team_scheduler_status = ...
+[任务结束] team_autopilot_status = ...
 [最终] json2csv.mjs 能否运行 = ...
 [最终] breaker 是否 ≠ closed = ...
 [最终] 是否观察到重复唤醒 = ...
@@ -93,6 +93,6 @@
 
 ## 六、前置
 
-1. `cordis.patch.yml` 里 `team-scheduler.dryRun` 必须是 `false`（当前已改好）。
+1. `cordis.patch.yml` 里 `team-autopilot.dryRun` 必须是 `false`（当前已改好）。
 2. 重启 Harness 后新开团队会话跑（不要复用旧会话）。
 3. 认领用 `team_task_update`（action=claim + expected_revision），不是 `team_task_claim`。

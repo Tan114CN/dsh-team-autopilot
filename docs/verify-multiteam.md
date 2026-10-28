@@ -1,6 +1,6 @@
 # 验证 0.1.2 多团队修复
 
-> 目的：确认 `dsh-team-scheduler@0.1.2` 修好了「调度器只盯第一个 Lead」的 bug，
+> 目的：确认 `dsh-team-autopilot@0.1.2` 修好了「调度器只盯第一个 Lead」的 bug，
 > 现在能同时服务多个团队会话、各自独立派发。
 
 ---
@@ -8,7 +8,7 @@
 ## 一、前置
 
 1. 已装 `0.1.2`（profile 依赖 `^0.1.2`，`verify-mount` 10 PASS）。
-2. `cordis.patch.yml` 里 `team-scheduler.dryRun` 当前是 **`true`**。
+2. `cordis.patch.yml` 里 `team-autopilot.dryRun` 当前是 **`true`**。
    - **只验证「调度器是否盯对团队」**：`dryRun:true` 就够（`dispatched` 会涨、`team=` 会显示正确 TeamId，只是不发消息）。
    - **想验证「真的发唤醒消息」**：把 `dryRun` 改成 `false` 再重启。
 3. **完全重启 Harness**（加载 0.1.2）。
@@ -19,8 +19,8 @@
 
 ### 第 1 步：开两个团队会话
 
-- 开**会话 A**：发一句给 Lead——「组建一个开发团队，spawn 一个成员叫 worker-a（prompt：原地待命，等 [team-scheduler] 消息再认领任务），建一个 ready 任务 task-a，writeScope 写 src/a，不要手动认领。」
-- 开**会话 B**：发一句给 Lead——「组建一个开发团队，spawn 一个成员叫 worker-b（prompt：原地待命，等 [team-scheduler] 消息再认领任务），建一个 ready 任务 task-b，writeScope 写 src/b，不要手动认领。」
+- 开**会话 A**：发一句给 Lead——「组建一个开发团队，spawn 一个成员叫 worker-a（prompt：原地待命，等 [team-autopilot] 消息再认领任务），建一个 ready 任务 task-a，writeScope 写 src/a，不要手动认领。」
+- 开**会话 B**：发一句给 Lead——「组建一个开发团队，spawn 一个成员叫 worker-b（prompt：原地待命，等 [team-autopilot] 消息再认领任务），建一个 ready 任务 task-b，writeScope 写 src/b，不要手动认领。」
 
 > 两个会话要**同时开着**，这是触发多团队场景的关键（只开一个就测不出 bug）。
 
@@ -29,13 +29,13 @@
 在**会话 A** 里：
 
 ```
-调用 team_scheduler_status
+调用 team_autopilot_status
 ```
 
 在**会话 B** 里：
 
 ```
-调用 team_scheduler_status
+调用 team_autopilot_status
 ```
 
 ### 第 3 步：对比关键字段
@@ -60,8 +60,8 @@
 
 把 `dryRun` 改成 `false` 再重启，然后：
 
-- 看 `worker-a` 会话是否收到 `[team-scheduler] Task task-a is ready and unowned...`；
-- 看 `worker-b` 会话是否收到 `[team-scheduler] Task task-b ...`；
+- 看 `worker-a` 会话是否收到 `[team-autopilot] Task task-a is ready and unowned...`；
+- 看 `worker-b` 会话是否收到 `[team-autopilot] Task task-b ...`；
 - 各自 `team_task_update(action=claim)` 认领 → 完成。
 
 两个 worker 应**各收到自己团队的那条**，而不是串到对方团队。
@@ -71,8 +71,8 @@
 ## 四、记录模板（贴回给我）
 
 ```
-[会话A] team_scheduler_status = ...
-[会话B] team_scheduler_status = ...
+[会话A] team_autopilot_status = ...
+[会话B] team_autopilot_status = ...
 [判断] 两个 team= 是否不同？两个 dispatched 是否都≥1？
 ```
 

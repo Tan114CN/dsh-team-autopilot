@@ -1,6 +1,6 @@
 # 多成员协作开发任务 · 观察插件行为
 
-> 目的：让 dsh 团队真的协作开发一个小工具，同时观察 `dsh-team-scheduler` 插件
+> 目的：让 dsh 团队真的协作开发一个小工具，同时观察 `dsh-team-autopilot` 插件
 > 在真实负载下的表现（尤其「熔断」和「wait_agent 共存」两项待验证行为）。
 
 ---
@@ -57,14 +57,15 @@
 ## 三、观察清单（任务跑起来后，逐项记录）
 
 ### A. 派发正路径（预期正常）
-- 建完任务后调 `team_scheduler_status`：
+- 建完任务后调 `team_autopilot_status`：
   - `dispatched` 应该涨（任务被派给空闲成员）
   - `claimable` = 还没被认领的 ready 任务数
   - `idle` = 空闲成员数
 - 任务板里 `ownerName` 从 `null` 变成某个成员
 
-### B. 写域冲突拦截（预期 `lastBlocked ≥ 1`）
-- 如果 parser 和 renderer 同时 ready、但只有一个空闲成员 → 第二个被拦，`lastBlocked` 涨
+### B. 写域冲突拦截（预期 `skipped` 的 `scope` 项 ≥ 1）
+- 如果 parser 和 renderer 同时 ready、但只有一个空闲成员 → 第二个被拦，`skipped` 涨（且涨的是 `noMember` 那一项）
+- 写域重叠（如两个任务都写 `src/auth` 前缀）时被拦，涨的才是 `scope` 那一项
 - 更直接：故意让一个成员「先认领 parser，再让另一个成员试图认领 renderer」，观察有没有因为依赖/写域产生的 `writeScopeWarnings`
 
 ### C. 熔断（待验证项，观察 `breaker` 字段）
@@ -74,12 +75,12 @@
 
 ### D. wait_agent 共存（待验证项）
 - 任务进行中，看成员收到的消息：
-  - 只收到 `[team-scheduler] Task ...` 一条 = 你插件在工作
+  - 只收到 `[team-autopilot] Task ...` 一条 = 你插件在工作
   - 如果同时收到官方 `wait_agent` 的消息 = 两个机制并存
   - **重点看**：同一个任务有没有被「两个机制」重复派给两个不同成员（这才是真正的冲突）
 
 ### E. 收尾
-- 所有任务完成后，查 `team_scheduler_status`：`inFlight=0`、`claimable=0`、`slots` 回满
+- 所有任务完成后，查 `team_autopilot_status`：`inFlight=0`、`claimable=0`、`slots` 回满
 - 确认 `md2html.mjs` 真的能跑：`node md2html.mjs README.md out.html`
 
 ---
@@ -89,10 +90,10 @@
 跑完后，把这些字段原样贴回给我（我据此判断插件行为）：
 
 ```
-[任务开始时] team_scheduler_status = ...
+[任务开始时] team_autopilot_status = ...
 [任务进行中] 成员收到的消息原文 = ...
 [任务进行中] 任务板 ownerName 变化 = ...
-[任务结束时] team_scheduler_status = ...
+[任务结束时] team_autopilot_status = ...
 [最终] md2html.mjs 能否运行 = ...
 [最终] 是否观察到 breaker≠closed = ...
 [最终] 是否观察到重复唤醒 = ...
@@ -102,7 +103,7 @@
 
 ## 五、注意事项
 
-1. **当前 `dryRun: true`** —— 如果你现在直接跑，调度器只会**计数、不会真的发消息**（成员不会被唤醒）。要观察真实派发，需要先把 `cordis.patch.yml` 里 `team-scheduler` 的 `dryRun` 改成 `false`，再重启 Harness。
+1. **当前 `dryRun: true`** —— 如果你现在直接跑，调度器只会**计数、不会真的发消息**（成员不会被唤醒）。要观察真实派发，需要先把 `cordis.patch.yml` 里 `team-autopilot` 的 `dryRun` 改成 `false`，再重启 Harness。
 2. 成员 spawn 时用你之前验证过的正确写法：认领任务用 `team_task_update`（`action=claim` + `expected_revision`），**不是** `team_task_claim`。
 3. 任务描述里写清「接口约定」（AST 的字段结构），否则 parser 和 renderer 会各自发明一套结构、对不上。
 
@@ -112,7 +113,7 @@
 
 用上面的任务模板实测了一次，结果**任务成功完成、产物真实可运行**（`E:\text\` 下产出 `md2html.mjs` + `src/parser.mjs` + `src/renderer.mjs` + `test/*`，测试全过、CLI 能跑），但**调度器实际上没有派发**——从解压的会话日志确认：
 
-- `[team-scheduler]` 唤醒消息出现 **0 次**；
+- `[team-autopilot]` 唤醒消息出现 **0 次**；
 - 4 个成员是**靠 spawn prompt 里「主动去 team_task_list 认领」的指令**把任务干完的，不是靠调度器唤醒。
 
 ### 原因（真实场景才暴露）
@@ -123,9 +124,9 @@
 
 要让调度器成为**唯一**的派发来源，spawn 成员的 prompt 必须写成「**被动等待**」，而不是「主动认领」：
 
-> 原地待命，不要主动去 `team_task_list` 认领任务；等收到以 `[team-scheduler]` 开头的消息后，再按消息里的 task id 用 `team_task_update`（action=claim + expected_revision）认领并完成。
+> 原地待命，不要主动去 `team_task_list` 认领任务；等收到以 `[team-autopilot]` 开头的消息后，再按消息里的 task id 用 `team_task_update`（action=claim + expected_revision）认领并完成。
 
-只有成员「被动等待」时，`dispatched` 才会增长、成员端才会出现 `[team-scheduler]` 唤醒消息，我们才能验证派发链路本身。
+只有成员「被动等待」时，`dispatched` 才会增长、成员端才会出现 `[team-autopilot]` 唤醒消息，我们才能验证派发链路本身。
 
 ### 附带结论
 

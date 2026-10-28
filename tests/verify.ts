@@ -1,5 +1,5 @@
 /**
- * Zero-dependency self-check for the scheduler decision core.
+ * Zero-dependency self-check for the autopilot decision core.
  *
  * `select.ts` imports types only, so Node's type stripping runs this directly
  * with no node_modules at all:  node tests/verify.ts
@@ -26,7 +26,11 @@ import {
 } from '../src/breaker.ts'
 import type { BreakerConfig } from '../src/breaker.ts'
 import { findLeads } from '../src/lead.ts'
+import { boardSummary } from '../src/select.ts'
+import { renderReport } from '../src/report.ts'
+import type { StatusReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
+import { planReclaim } from '../src/reclaim.ts'
 
 /** Build one task view with sane defaults. `id` stays a plain string here. */
 function task(over: Omit<Partial<TeamTaskView>, 'id'> & { id: string }): TeamTaskView {
@@ -190,6 +194,27 @@ test('planDispatch reports when no idle teammate is left', () => {
   assert.match(result.blocked[0]?.reason ?? '', /no idle teammate/)
 })
 
+test('blocked tasks carry a machine-readable kind', () => {
+  // Two ways to skip a task, with opposite remedies: widen the scopes, or
+  // add a member. A free-text reason alone cannot be counted on.
+  const scope = planDispatch({
+    tasks: [
+      task({ id: 't0', status: 'in_progress', ownerName: 'alice', writeScopes: ['src/auth'] }),
+      task({ id: 't1', writeScopes: ['src/auth/login'] }),
+    ],
+    members: [member('alice', 'running'), member('bob', 'inactive')],
+    maxConcurrent: 4,
+  })
+  assert.equal(scope.blocked[0]?.kind, 'scope')
+
+  const noMember = planDispatch({
+    tasks: [task({ id: 't1' })],
+    members: [],
+    maxConcurrent: 4,
+  })
+  assert.equal(noMember.blocked[0]?.kind, 'noMember')
+})
+
 test('wakeMessage tells the member to claim with the revision', () => {
   const plan: DispatchPlan = {
     taskId: 't1',
@@ -351,7 +376,7 @@ test('wakeMessage neutralizes newlines and backticks in the subject', () => {
 test('findLeads resolves every live Lead, not just the first', () => {
   // Real regression: the desktop host keeps several sessions alive, each its
   // own Team. The old `findLead` returned the first-registered Lead and the
-  // scheduler silently ignored every other team. `findLeads` must enumerate
+  // autopilot silently ignored every other team. `findLeads` must enumerate
   // all of them so each team gets dispatched independently.
   const agents = [
     { id: 'root-a' },
@@ -383,6 +408,226 @@ test('findLeads returns empty when no Team exists', () => {
     agentTeams: { tryMembership: () => undefined },
   }
   assert.deepEqual(findLeads(ctx as never), [])
+})
+
+test('boardSummary agrees with planDispatch on the in-flight count', () => {
+  // The reported `inFlight`/`slots` must describe the same decision the
+  // autopilot made, so a reader can trust the numbers.
+  const board = [
+    task({ id: 't1', status: 'in_progress', ownerName: 'alice' }),
+    task({ id: 't2', status: 'pending', ownerName: 'bob' }),
+    task({ id: 't3', status: 'pending', ready: true }),
+    task({ id: 't4', status: 'completed', ownerName: 'carol' }),
+  ]
+  const members = [
+    member('lead', 'running', 'lead'),
+    member('alice', 'running'),
+    member('bob', 'running'),
+    member('dave', 'inactive'),
+  ]
+  const decision = planDispatch({ tasks: board, members, maxConcurrent: 2 })
+  const summary = boardSummary(board, members, 2)
+  assert.equal(summary.inFlight, decision.inFlight)
+  assert.equal(summary.slots, Math.max(0, 2 - decision.inFlight))
+  // t1 and t2 hold slots; t3 is claimable; t4 is completed and holds nothing.
+  assert.equal(summary.inFlight, 2)
+  assert.equal(summary.tasks, 4)
+  assert.equal(summary.claimable, 1)
+  // dave is idle and holds no work, so exactly one teammate is available.
+  assert.equal(summary.idle, 1)
+})
+
+test('boardSummary counts a completed task as holding no slot', () => {
+  const board = [task({ id: 't1', status: 'completed', ownerName: 'alice' })]
+  const summary = boardSummary(board, [member('alice', 'inactive')], 2)
+  assert.equal(summary.inFlight, 0)
+  assert.equal(summary.slots, 2)
+  assert.equal(summary.idle, 1)
+})
+
+test('renderReport separates the caller\'s live board from per-team snapshots', () => {
+  const report: StatusReport = {
+    enabled: true,
+    dryRun: false,
+    rounds: 3,
+    dispatched: 2,
+    suppressed: 1,
+    skipped: 0,
+    unclaimed: 0,
+    reclaimed: 0,
+    teams: [
+      {
+        team: 'team-a',
+        ticks: 3,
+        dispatched: 2,
+        suppressed: 1,
+        skipped: 0,
+        skippedScope: 0,
+        skippedNoMember: 0,
+        unclaimed: 0,
+        breaker: 'closed',
+        breakerTrips: 0,
+        breakerBlocked: 0,
+        reclaimed: 0,
+        tasks: 1,
+        inFlight: 1,
+        claimable: 0,
+        idle: 0,
+        slots: 1,
+        lastTickAt: 1_000,
+      },
+    ],
+    caller: {
+      team: 'team-a',
+      tasks: 1,
+      inFlight: 1,
+      claimable: 0,
+      idle: 0,
+      slots: 1,
+    },
+  }
+  const text = renderReport(report, 3_000).join('\n')
+  assert.match(text, /autopilot active/)
+  // Totals and the per-team breakdown are labelled separately.
+  assert.match(text, /totals rounds=3 dispatched=2 suppressed=1/)
+  assert.match(text, /teams=1/)
+  // The caller's board is marked live, the per-team row carries its age.
+  assert.match(text, /caller team=team-a .*\(live\)/)
+  assert.match(text, /team=team-a ticks=3 .*\(2000ms ago\)/)
+})
+
+test('renderReport names the last reclaim and dispatch instead of only counting them', () => {
+  const report: StatusReport = {
+    enabled: true,
+    dryRun: false,
+    rounds: 9,
+    dispatched: 4,
+    suppressed: 5,
+    skipped: 1,
+    unclaimed: 2,
+    reclaimed: 2,
+    teams: [
+      {
+        team: 'team-a',
+        ticks: 9,
+        dispatched: 4,
+        suppressed: 5,
+        skipped: 1,
+        skippedScope: 1,
+        skippedNoMember: 0,
+        unclaimed: 2,
+        breaker: 'closed',
+        breakerTrips: 0,
+        breakerBlocked: 0,
+        reclaimed: 2,
+        tasks: 3,
+        inFlight: 0,
+        claimable: 1,
+        idle: 2,
+        slots: 2,
+        lastTickAt: 2_000,
+        lastReclaim: {
+          taskId: 'task-3',
+          reason: 'owner "worker-a" inactive for 60012ms',
+          previousOwner: 'worker-a',
+          at: 2_500,
+          applied: true,
+        },
+        lastDispatch: {
+          taskId: 'task-3',
+          memberName: 'worker-a',
+          at: 2_800,
+          repeats: 3,
+          sent: true,
+          claimed: false,
+        },
+      },
+    ],
+  }
+  const text = renderReport(report, 3_000).join('\n')
+  // The skip total is broken down, so the two opposite fixes are told apart.
+  assert.match(text, /skipped=1 \(scope=1 noMember=0\)/)
+  // Which task came back, from whom, and why — not just "reclaimed=2".
+  assert.match(text, /lastReclaim task=task-3 from=worker-a reason='owner "worker-a" inactive for 60012ms' applied \(500ms ago\)/)
+  // Which task went to whom, how many times, and whether it was picked up.
+  assert.match(text, /lastDispatch task=task-3 to=worker-a wakes=3 sent outcome=unclaimed \(200ms ago\)/)
+  // The loop signature is called out instead of left for the reader to infer.
+  assert.match(text, /warning: 2 wakes went unclaimed/)
+})
+
+test('reclaims a task whose owner left the roster', () => {
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'ghost' })]
+  const result = planReclaim({
+    tasks: board,
+    members: [member('lead', 'running', 'lead')],
+    now: 1_000,
+    reclaimAfterMs: 300_000,
+    reclaimOnFailed: true,
+    stalled: new Map(),
+  })
+  assert.equal(result.releases.length, 1)
+  const release = result.releases[0]
+  assert.ok(release !== undefined)
+  assert.equal(release.taskId, 't1')
+  assert.equal(release.previousOwner, 'ghost')
+  assert.match(release.reason, /no longer on the roster/)
+})
+
+test('reclaims from a failed owner only when that is enabled', () => {
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const base = {
+    tasks: board,
+    members: [member('lead', 'running', 'lead'), member('alice', 'failed')],
+    now: 1_000,
+    reclaimAfterMs: 300_000,
+  }
+  const on = planReclaim({ ...base, reclaimOnFailed: true, stalled: new Map() })
+  assert.equal(on.releases.length, 1)
+  const off = planReclaim({ ...base, reclaimOnFailed: false, stalled: new Map() })
+  assert.equal(off.releases.length, 0)
+})
+
+test('reclaims an inactive owner only after the grace period', () => {
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const base = {
+    tasks: board,
+    members: [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+    reclaimAfterMs: 300_000,
+    reclaimOnFailed: true,
+  }
+  // First sighting: the stall is recorded, nothing is taken yet.
+  const first = planReclaim({ ...base, now: 10_000, stalled: new Map() })
+  assert.equal(first.releases.length, 0)
+  assert.equal(first.stalled.get('t1'), 10_000)
+  // Still inside the grace period.
+  const waiting = planReclaim({ ...base, now: 20_000, stalled: first.stalled })
+  assert.equal(waiting.releases.length, 0)
+  // Past it: the task goes back to the pool and the entry is dropped.
+  const done = planReclaim({ ...base, now: 400_000, stalled: first.stalled })
+  assert.equal(done.releases.length, 1)
+  const released = done.releases[0]
+  assert.ok(released !== undefined)
+  assert.match(released.reason, /inactive for 390000ms/)
+  assert.equal(done.stalled.has('t1'), false)
+})
+
+test('never reclaims from a running owner or from the Lead', () => {
+  const board = [
+    task({ id: 't1', status: 'in_progress', ownerName: 'alice' }),
+    task({ id: 't2', status: 'in_progress', ownerName: 'lead' }),
+    task({ id: 't3', status: 'pending', ready: true }),
+  ]
+  const result = planReclaim({
+    tasks: board,
+    members: [member('lead', 'running', 'lead'), member('alice', 'running')],
+    now: 999_999,
+    reclaimAfterMs: 1_000,
+    reclaimOnFailed: true,
+    // Stale entries from an earlier stall are cleared, not acted on.
+    stalled: new Map([['t1', 0], ['t2', 0]]),
+  })
+  assert.equal(result.releases.length, 0)
+  assert.equal(result.stalled.size, 0)
 })
 
 if (failures.length > 0) {

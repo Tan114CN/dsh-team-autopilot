@@ -5,6 +5,50 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+## [0.2.0] - 2026-10-28
+
+> 含一次**破坏性更名**（`dsh-team-scheduler` → `dsh-team-autopilot`）与一次**行为变更**（`skipped` 改为累计），详见下方「变更」。
+
+### 新增
+
+- **status 可观测性**：僵死回收真机验证时，为排除「任务是被回收的还是被成员自己抢的」歧义，只能盯着 revision 数字反推——根因是报告里只有一个 `reclaimed` 计数。新增四类字段：
+  - `lastReclaim`（task / from=原 owner / reason / 时刻 / `applied`）：回答「刚收回的是哪个任务、从谁手里、为什么」。`dryRun` 下同样记录，但 `applied=false`，因为要看的是**判定**而非副作用。
+  - `lastDispatch`（task / to=成员 / **`wakes`** 次数 / `sent` / `outcome` / 时刻）：回答「派给谁、叫了几次、有没有人接」。同一任务同一成员再次被唤醒时**不另开记录**，而是累加 `wakes` 并保留已判定的结果——否则每轮一覆盖，这字段将永远显示 `unchecked`，循环反而看不见。
+  - `unclaimed`：**唤醒后下一次读板时仍无主**的次数。反复不接活的成员会一直占住派发通道，这是插件当前唯一能让它显形的数字。每次唤醒只计一次（不按轮累加，否则任务滞留期间会虚高）；`unclaimed >= 2` 时报告多打一行 warning。
+  - `skipped` 拆成 `scope`（写域冲突）与 `noMember`（无空闲成员）：两个相反的处置（放宽写域 vs 加人），只有一个总数时读者得回头翻日志才能分辨。为此 `BlockedTask` 新增机器可读的 `kind`。
+  - **行为变更**：`skipped` 由「上一轮的值」改为**累计**，与 `dispatched` / `suppressed` / `reclaimed` 一致——之前它每轮被覆盖（`team.skipped = blocked.length`），唯一一个非累计的计数器。
+
+- **僵死任务回收**。官方明说「不会自动释放 owner」：成员停摆后任务永久挂在 `in_progress`，占着写域与并发槽，且无人可认领。新增 `src/reclaim.ts`（纯函数、零依赖）+ 两个配置项：
+  - `reclaimAfterMs`（默认 `300000`）：持有者 `inactive` 持续多久后回收——给足启动宽限期，避免误伤刚被唤醒还在拉起的成员。
+  - `reclaimOnFailed`（默认 `true`）：持有者 `failed` 时是否立即回收。
+  - 机制用 **`reassign` 动作且不带 owner**（Lead-only）：把任务清回 `pending` 且无主，正好落回 `claimableTasks` 判定，下一轮重新派发并再过一遍写域软锁与并发预算。**回池，不是换人**——这与 nanmicoder 的 `reassign_task`（指定新 owner）是相反语义。
+  - 选 `reassign` 而非 `release`：后者只认 `in_progress`，覆盖不了「已认领但未开工」的 `pending`，而占槽的正是这两种。
+  - 三种僵死按确定性递减：owner 不在 roster（立即）→ owner `failed`（立即）→ owner `inactive` 超时（宽限期后）。Lead 持有的任务一律不动。
+  - 回收在派发**之前**执行，释放的槽位同轮即可复用；同轮内刚回收的任务不会派回刚被剥夺的成员，避免「僵死 → 回收 → 还给他 → 再僵死」。
+  - **已在真实宿主上验证**（2026-10-28，桌面 profile，`reclaimAfterMs: 60000`）：`dryRun: true` 下 `reclaimed` 递增而任务三项属性不变（只判定不落库）；`dryRun: false` 下任务从 `in_progress` / owner=`worker-a` / rev 2 变为 `pending` / owner 清空 / rev 3，`claimable` +1——revision 递增证明 compare-and-set 真实落库。
+  - 诊断：`team_autopilot_status` 的 totals 与每个团队行新增 `reclaimed`。
+
+### 变更
+
+- **项目更名**：`dsh-team-scheduler` → **`dsh-team-autopilot`**（破坏性）。同步改动：服务 / patch id `team-autopilot`、工具名 `team_autopilot_status`、配置前缀 `team-autopilot.*`、内部类型 `AutopilotState` / `createAutopilotState`、纯文本报告输出 `autopilot active|inactive`、日志前缀 `[team-autopilot]`。
+  - 更名理由：`scheduler` 在 dsh 生态已被占用两次语义（官方 `schedule-bundle` 是**定时提醒**；官方代码里的 `scheduler` 指 `scheduleRecovery` 崩溃恢复），且该词只覆盖 dispatch 一项，覆盖不了 reclaim / retry / budget。`autopilot` 传达「无人值守、系统自己转」，与竞品的模型驱动形成反差。
+  - 迁移：已装旧版需手工把 `cordis.patch.yml` 里的配置前缀从 `team-scheduler.*` 改为 `team-autopilot.*`；调用方若直接用 `team_scheduler_status` 工具名，需同步改为 `team_autopilot_status`。
+- `BlockedTask` 新增机器可读的 `kind: 'scope' | 'noMember'`（此前只有 `reason` 文本），供 status 拆分跳过原因。
+- `package.json` description 改为「Deterministic auto-dispatch for native DeepSeek Harness Agent Teams」。
+
+### 文档
+
+- 新增 README「可观测性：status 字段怎么读」：输出样例 + 四类字段各自回答什么问题 + `wakes` / `unclaimed` 的判定规则（为何不按轮累加）。
+- 修正文档中已失效的字段名：`lastBlocked` / `blocked=0` → `skipped`（并拆分 `scope` / `noMember`），涉及 `docs/verify-host.md`、`docs/team-collab-task.md`、README 观察点与真机验证记录。
+- `docs/verify-host.md` 的状态输出样例更新为真实格式（`totals` / `caller` / `team=` 三层结构 + 快照年龄），并修正一处错误说明：`inactive` 来自 `dryRun`，`enabled` 仍为 `true`。
+- `docs/verify-reclaim.md`「观测字段」补 `lastReclaim` / `lastDispatch` / `unclaimed`；「已知限制」第 2 条补真机循环实证（revision 3 → 20）与现在的观测方式。
+- README 首屏定位改写：从「补上游空档」改为**类别声明**——确定性调度 vs 模型驱动、原生 seam vs 自建团队层、不建第二个团队层。
+- 新增「和别的团队插件有什么不一样」：按「决策由谁做出 × 团队状态存在哪」两个维度做生态定位对比，点名区分自建派与原生派。
+- 新增「官方会不会把这些做了」：引用 `goal-round-driver` 三句书面声明（编排 / 资源预算 / 异常重试均划归插件层），并附 `experimental-agent-team` 中 `dispatch` / `autoAssign` 命中 0 文件的核验结果。
+- 边界一节补两条：**不做 per-member model** 的三层事实（subagent 层支持 `agentOptions.model`，Team 层未转发）、**尚未做** 三项（僵死回收 / 投递重试 / token 预算闸）及各自对应的官方书面依据。
+
 ## [0.1.2] - 2026-10-28
 
 ### 修复
@@ -36,6 +80,6 @@
 ### 新增
 
 - 首个正式发布。自动派发调度器：任务就绪且无主时唤醒空闲成员，并把 advisory 的写域重叠警告变成派发时刻的有效软锁。
-- `team_scheduler_status` 诊断工具（`rounds` / `dispatched` / `suppressed` / `lastBlocked` / `breaker` / 团队诊断字段）。
+- `team_autopilot_status` 诊断工具（`rounds` / `dispatched` / `suppressed` / `lastBlocked` / `breaker` / 团队诊断字段）。
 - 熔断状态机：连续 `sendMessage` 失败后切开电路，冷却后半开探针恢复。
 - 团队级并发预算 + `teamBudgets` 覆盖。

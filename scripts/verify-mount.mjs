@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Verify the dsh-team-scheduler mount inside a dsh desktop profile.
+ * Verify the dsh-team-autopilot mount inside a dsh desktop profile.
  *
  * This checks the *mount prerequisites* (files, entry points, lockfile, bundle
  * registration, first-run dryRun). It cannot prove the app actually loaded the
  * plugin — that requires restarting the app and observing it (see
  * docs/verify-host.md). Run it before AND after a restart; the "runtime" part
- * is what the app logs and the `team_scheduler_status` tool tell you.
+ * is what the app logs and the `team_autopilot_status` tool tell you.
  *
  * Usage:
  *   node scripts/verify-mount.mjs
@@ -20,7 +20,7 @@ import { homedir } from 'node:os'
 const profile = resolve(
   process.env.DSH_PROFILE ?? join(homedir(), '.dsh', 'profiles', 'desktop'),
 )
-const pluginDir = join(profile, 'node_modules', 'dsh-team-scheduler')
+const pluginDir = join(profile, 'node_modules', 'dsh-team-autopilot')
 
 const results = []
 const check = (label, ok, detail = '') => results.push({ label, ok: Boolean(ok), detail, warn: false })
@@ -42,8 +42,8 @@ if (profilePkgText === undefined) {
 }
 if (profilePkg !== undefined) {
   const bundles = profilePkg.dsh?.profile?.bundles ?? []
-  check('bundle "dsh-team-scheduler" registered', bundles.includes('dsh-team-scheduler'))
-  const dep = profilePkg.dependencies?.['dsh-team-scheduler']
+  check('bundle "dsh-team-autopilot" registered', bundles.includes('dsh-team-autopilot'))
+  const dep = profilePkg.dependencies?.['dsh-team-autopilot']
   check('dependency declared', dep !== undefined, dep ?? 'missing')
 }
 
@@ -69,16 +69,16 @@ const lock = readText(join(profile, 'pnpm-lock.yaml'))
 if (lock === undefined) {
   check('pnpm-lock.yaml readable', false)
 } else {
-  check('lockfile records dsh-team-scheduler', /dsh-team-scheduler:[\s\S]{0,160}?specifier:\s*(file:|[\^~]?\d)/.test(lock))
+  check('lockfile records dsh-team-autopilot', /dsh-team-autopilot:[\s\S]{0,160}?specifier:\s*(file:|[\^~]?\d)/.test(lock))
 }
 
-// 5. First-run safety: profile patch must force dryRun for team-scheduler.
+// 5. First-run safety: profile patch must force dryRun for team-autopilot.
 const patch = readText(join(profile, 'cordis.patch.yml'))
 if (patch === undefined) {
   check('profile cordis.patch.yml readable', false)
 } else {
-  check('profile patch targets team-scheduler', /-\s*id:\s*team-scheduler\b/.test(patch))
-  const dry = /id:\s*team-scheduler[\s\S]*?dryRun:\s*(true|false)/.exec(patch)
+  check('profile patch targets team-autopilot', /-\s*id:\s*team-autopilot\b/.test(patch))
+  const dry = /id:\s*team-autopilot[\s\S]*?dryRun:\s*(true|false)/.exec(patch)
   check('first-run dryRun === true', dry?.[1] === 'true', dry ? `dryRun: ${dry[1]}` : 'not set (plugin default false)')
 }
 
@@ -97,7 +97,7 @@ if (existsSync(logsDir)) {
       if (st.isDirectory()) { walk(full, depth + 1); continue }
       if (!/\.(log|ndjson|jsonl|json|txt)$/i.test(entry)) continue
       const text = readText(full)
-      if (text !== undefined && /team-scheduler|team_scheduler_status/.test(text)) hits += 1
+      if (text !== undefined && /team-autopilot|team_autopilot_status/.test(text)) hits += 1
     }
   }
   walk(logsDir, 0)
@@ -106,7 +106,7 @@ if (existsSync(logsDir)) {
     hits > 0,
     hits > 0
       ? `${hits} file(s) mention the plugin`
-      : 'no startup log on disk; confirm by calling team_scheduler_status in a dsh session',
+      : 'no startup log on disk; confirm by calling team_autopilot_status in a dsh session',
   )
 }
 

@@ -8,7 +8,7 @@
  *
  * The desktop host keeps several sessions alive at once, and every session is
  * its own Team. Resolving only the first Lead (the previous behaviour) would
- * bind the scheduler to whichever Team happened to register first and silently
+ * bind the autopilot to whichever Team happened to register first and silently
  * ignore the others — so this module resolves *all* live Leads instead.
  */
 
