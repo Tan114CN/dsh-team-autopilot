@@ -15,8 +15,56 @@
  * running autopilot except through what the autopilot writes down.
  */
 
-import { appendFile, readFile, stat, writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { appendFile, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import type { Config } from './index.ts'
 import type { TeamState } from './state.ts'
+
+/**
+ * The version of the plugin that is running.
+ *
+ * Read from the package manifest beside the entry point rather than injected at
+ * build time: the same file then works unbundled in tests and bundled in
+ * `dist/`, with no build step to remember. Configuration is the other half of
+ * "what is actually running" — after a restart a stale profile is
+ * indistinguishable from a working one until something misbehaves, and a boot
+ * marker ends that guesswork.
+ * @returns the package version, or `unknown` if the manifest cannot be read.
+ */
+let cachedVersion: string | undefined
+function version(): string {
+  if (cachedVersion !== undefined) return cachedVersion
+  try {
+    const manifest = new URL('../package.json', import.meta.url)
+    cachedVersion = String((JSON.parse(readFileSync(manifest, 'utf8')) as { version?: string }).version)
+  } catch {
+    cachedVersion = 'unknown'
+  }
+  return cachedVersion
+}
+
+/**
+ * Format one process start as a single line.
+ *
+ * Written once per loop start, not per round: it answers "which build, with
+ * which settings" for the whole run, and a restart is then visible in the log
+ * as a marker rather than as a `ticks=1` the reader has to decode.
+ * @param at - epoch milliseconds of the start.
+ * @param config - resolved configuration the loop is about to run with.
+ * @returns the line, without a trailing newline.
+ */
+export function startupLine(at: number, config: Required<Config>): string {
+  return [
+    new Date(at).toISOString(),
+    'autopilot-start',
+    `version=${version()}`,
+    `tickMs=${config.tickTimeoutMs}`,
+    `wakeMs=${config.wakeCooldownMs}`,
+    `reclaimMs=${config.reclaimAfterMs}`,
+    `heartbeatMs=${config.statusHeartbeatMs}`,
+    `dryRun=${config.dryRun}`,
+  ].join(' ')
+}
 
 /**
  * Bytes after which the log is trimmed back to its trailing half.
@@ -54,6 +102,8 @@ export function statusLine(team: TeamState, at: number): string {
     `tasks=${team.tasks}`,
     `inFlight=${team.inFlight}`,
     `claimable=${team.claimable}`,
+    `blocked=${team.blocked}`,
+    `done=${team.done}`,
     `idle=${team.idle}`,
     `slots=${team.slots}`,
     `breaker=${team.breaker}`,
@@ -113,7 +163,12 @@ export async function appendStatusLine(path: string, line: string): Promise<void
     // Keep the trailing half: the newest rounds are the ones worth reading,
     // and halving avoids re-trimming on the very next append.
     const kept = lines.slice(Math.floor(lines.length / 2)).join('\n')
-    await writeFile(path, kept, 'utf8')
+    // Write aside and rename: a truncating write leaves a half-written log if
+    // the host dies mid-trim, and the log is often the only thing left to read
+    // after a crash. Rename replaces the file atomically within one volume.
+    const staged = `${path}.tmp`
+    await writeFile(staged, kept, 'utf8')
+    await rename(staged, path)
   } catch {
     // A failed trim only means the file keeps growing until the next attempt.
   }

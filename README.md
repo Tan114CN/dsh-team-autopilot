@@ -356,10 +356,11 @@ team-autopilot:
   statusFile: C:/Users/you/.dsh/profiles/desktop/team-autopilot.log
 ```
 
-只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒）：
+只要这一轮的字段跟前一行不一样就追加一行，在轮次末尾写（记录的是这一轮产生的结果，含刚发出的唤醒），并在每次进程启动时先写一行启动标记：
 
 ```
-2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 unclaimed=2 reclaimed=0 tasks=4 inFlight=0 claimable=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
+2026-10-28T08:31:02.004Z autopilot-start version=0.3.2 tickMs=30000 wakeMs=60000 reclaimMs=60000 heartbeatMs=600000 dryRun=false
+2026-10-28T15:52:31.412Z team=session-20f06011-6fdd ticks=12 dispatched=2 suppressed=1 skip=3 scope=0 noMember=0 declined=3 unclaimed=2 reclaimed=0 tasks=4 inFlight=0 claimable=1 blocked=2 done=1 idle=2 slots=2 breaker=closed trips=0 held=0 wake=task-4>worker-a wakes=1 outcome=unclaimed reclaim=task-3<worker-a reclaimed
 ```
 
 单行是刻意的：`tail -1` 是当前状态，`tail -30` 是最近历史，`grep -c` 数得出重复次数。多行美化版必须整份读完才有用，那对日志等于永远不会被读。
@@ -368,14 +369,28 @@ team-autopilot:
 tail -1 team-autopilot.log                      # 现在什么状态
 tail -20 team-autopilot.log | grep 'unclaimed=[1-9]'   # 出现过未认领的轮次
 grep -c 'outcome=unclaimed' team-autopilot.log  # 累计多少次唤醒石沉大海
+grep 'autopilot-start' team-autopilot.log       # 每次重启：哪个版本、什么配置
 ```
 
-- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两天团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写
+**任务四个桶是分区，不是四个独立计数**：`inFlight + claimable + blocked + done == tasks`。
+
+| 桶 | 含义 | 派不发的原因 |
+|---|---|---|
+| `inFlight` | `in_progress`，或 `pending` 但已有 owner | 槽被占着 |
+| `claimable` | `pending` + `ready` + 无 owner | ——（该派就派） |
+| `blocked` | `pending` + 不 ready + 无 owner | **卡在自己的依赖上** |
+| `done` | `completed` / `deleted` | 已经完事 |
+
+所以 `tasks=4 inFlight=0 claimable=0` 这种「看着该派却派不出去」的谜面，配上 `blocked=2 done=2` 就直接变成答案——不需要再回一轮对话去问。
+
+- **启动标记行**：每次进程启动写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… heartbeatMs=… dryRun=…`。没有它，重启后「跑的是不是新版本、配置生效了没」只能靠猜；`ticks=1` 虽然也能当重启标记，但说不出跑的是哪个 build
+- **没变化的轮次不写**。循环每 30 秒每个团队都要 tick 一次，哪怕什么都没发生；逐轮写会让真正值得看的轮次淹在同样的行里——真机两团队实测 2.8 MB/天，一小时内就撞上 128 KB 上限、裁完只剩半小时历史。所以只写变化，另加一行心跳：`statusHeartbeatMs`（默认 10 分钟）内没变化才跳过，设 `0` 恢复逐轮写
 - 默认**关闭**，仓库模板也不开——插件不主动往磁盘写东西
 - 写入失败一律静默：观测是便利，满盘或只读 profile 不能卡住派发
 - **熔断打开导致这一轮没派发时也会写**——那正是最该看日志的时刻，静默等于在最需要的时候失声
-- 超过 128 KB 自动裁掉前半，保留尾部
+- 超过 128 KB 自动裁掉前半，保留尾部；裁剪走「写临时文件 + 原子 rename」，进程在裁剪中途死掉也不会留下半个日志
 - `dryRun` 下照写，回收记为 `reclaim-dry-run`——要看的是判定，不是副作用
+- **已知限制**：单进程内所有写入都是 `await` 串行的，安全；但如果同一个 profile 同时跑桌面 App 和一个 `dsh` CLI 会话，两个进程共写同一文件时，裁剪那一步的读-改-写不是跨进程安全的，理论上会吞掉对方刚追加的行。用一个专属的 `statusFile` 路径即可避开
 
 ## 边界
 

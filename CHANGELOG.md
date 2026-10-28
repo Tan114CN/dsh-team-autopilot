@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-10-28
+
+### 新增
+
+- **任务四个桶**：`tasks` 现在分成 `inFlight` / `claimable` / `blocked` / `done`，四者之和恒等于 `tasks`。state 快照、status 报告、日志行三处同步。
+  - 动机来自真机：`tasks=4 inFlight=0 claimable=0 idle=2` 这行「看着该派却派不出去」的谜面，光看计数没法判断是卡依赖、还是活都干完了，得再烧一轮对话去调 `team_autopilot_status`。`blocked` 是 `pending`、不 `ready`、无 owner 的任务数，`done` 是 `completed`/`deleted`。
+  - `blocked` 由减法得出（`tasks - inFlight - claimable - done`），恒等式因此是结构保证的，不会出现四个数互相矛盾。
+- **启动标记行**：进程启动时先写一行 `autopilot-start version=… tickMs=… wakeMs=… reclaimMs=… heartbeatMs=… dryRun=…`。重启后「跑的是不是新版本、配置生效了没」以前只能靠猜；`ticks=1` 能当重启标记，但说不出是哪个 build。
+- status 报告里 `lastReclaim` / `lastDispatch` 无记录时改打 `none`，不再整行省略——省略与「这个版本不支持该字段」在输出上原本完全一样。
+
+### 修复
+
+- **日志裁剪改为写临时文件 + 原子 rename**。原来是截断重写，进程若在裁剪中途死掉会留下半个日志，而崩溃后那往往正是唯一能读的东西。
+- 轮次加上 1 秒最小间隔（且不超过配置的 `tickTimeoutMs`）。这不是节拍——节拍是 change-wait 的超时；它只防一种情况：宿主把 `waitForChange` 改成立刻结算，此时每个结算都会把团队排队、排队就直接服务，循环会空转到打满 CPU。正常早醒远快于 1 秒，不受影响。
+
 ## [0.3.1] - 2026-10-28
 
 ### 新增

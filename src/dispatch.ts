@@ -25,7 +25,7 @@ import {
 import type { Breaker, BreakerConfig, BreakerState } from './breaker.ts'
 import { createAutopilotState, teamState } from './state.ts'
 import type { AutopilotState, TeamState } from './state.ts'
-import { appendStatusLine, statusLine, statusSignature } from './observe.ts'
+import { appendStatusLine, startupLine, statusLine, statusSignature } from './observe.ts'
 
 /**
  * Interruptible pause.
@@ -51,6 +51,15 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
     signal.addEventListener('abort', onAbort, { once: true })
   })
 }
+
+/**
+ * Floor on how often a round may run.
+ *
+ * Not a cadence — the cadence is the change-wait timeout. This only stops a
+ * wait that settles for the wrong reason from spinning the loop, and it is
+ * capped by the configured interval so it can never become the cadence itself.
+ */
+const MIN_ROUND_SPACING_MS = 1_000
 
 /**
  * Exponential backoff for consecutive loop failures, capped at 30s.
@@ -349,6 +358,8 @@ export async function tick(
   team.tasks = summary.tasks
   team.inFlight = summary.inFlight
   team.claimable = summary.claimable
+  team.blocked = summary.blocked
+  team.done = summary.done
   team.idle = summary.idle
   team.slots = summary.slots
   // Cumulative, like every other counter here: "how many skip decisions has
@@ -458,6 +469,15 @@ export async function loop(
   const dirty = new Set<string>()
   let waitFailed = false
   let failures = 0
+  let lastRoundAt: number | undefined
+  const spacingMs = Math.min(MIN_ROUND_SPACING_MS, config.tickTimeoutMs)
+
+  // One line per process start, so the log says which build and which settings
+  // are running. Without it a stale profile and a current one look the same
+  // until something misbehaves.
+  if (config.statusFile !== '') {
+    await appendStatusLine(config.statusFile, startupLine(Date.now(), config))
+  }
 
   const teamKeyFor = (lead: Agent): string => {
     const membership = ctx.agentTeams.tryMembership(lead)
@@ -550,6 +570,17 @@ export async function loop(
       if (signal.aborted) return
     }
 
+    // A change-wait that settles for the wrong reason — instantly, on every
+    // message rather than on a board change — would otherwise spin the loop at
+    // full speed: each settle queues its team, and a queued team is served
+    // without waiting. One round per second is orders of magnitude more than
+    // the interval needs, and it bounds the damage of a misbehaving wait.
+    if (lastRoundAt !== undefined) {
+      const since = Date.now() - lastRoundAt
+      if (since < spacingMs) await pause(spacingMs - since, signal)
+      if (signal.aborted) return
+    }
+    lastRoundAt = Date.now()
     state.rounds += 1
 
     // Serve the teams that actually woke this round. The status line reports

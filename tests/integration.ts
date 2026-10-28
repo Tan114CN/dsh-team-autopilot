@@ -583,6 +583,24 @@ await test('serves only the team whose change-wait fired', async () => {
   assert.equal(state.teams.get('team-0'), undefined)
 })
 
+await test('writes a boot marker before the first round', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-boot-'))
+  const file = join(dir, 'status.log')
+  const { ctx } = makeLoopCtx(1, { manual: true, intervalMs: 60_000 })
+  const state = freshState()
+  const controller = new AbortController()
+  const config: Required<Config> = { ...baseConfig, statusFile: file, tickTimeoutMs: 60_000 }
+  void loop(ctx, config, state, controller.signal).catch(() => undefined)
+  await new Promise<void>(resolve => setTimeout(resolve, 30))
+  controller.abort()
+
+  const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+  // A restart is otherwise only visible as `ticks=1`, which says nothing about
+  // which build came back or which settings it is running with.
+  assert.match(lines[0] ?? '', /autopilot-start version=\d+\.\d+\.\d+ /)
+  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 heartbeatMs=600000 dryRun=false$/)
+})
+
 if (failures.length > 0) {
   console.error(`FAILED ${failures.length}`)
   for (const line of failures) console.error(`  - ${line}`)

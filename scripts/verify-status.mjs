@@ -172,6 +172,8 @@ const warm = {
     tasks: 1,
     inFlight: 1,
     claimable: 0,
+    blocked: 0,
+    done: 0,
     idle: 0,
     slots: 1,
     lastTickAt: 1_000,

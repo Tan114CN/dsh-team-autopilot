@@ -50,6 +50,10 @@ export interface TeamReport {
   inFlight: number
   /** Ready, unowned tasks at the team's last observation. */
   claimable: number
+  /** Unowned tasks waiting on their dependencies at the last observation. */
+  blocked: number
+  /** Finished tasks at the team's last observation. */
+  done: number
   /** Idle teammates at the team's last observation. */
   idle: number
   /** Free concurrency slots at the team's last observation. */
@@ -72,6 +76,10 @@ export interface LiveBoard {
   inFlight: number
   /** Ready, unowned tasks right now. */
   claimable: number
+  /** Unowned tasks waiting on their dependencies right now. */
+  blocked: number
+  /** Finished tasks right now. */
+  done: number
   /** Teammates eligible to take new work right now. */
   idle: number
   /** Free concurrency slots right now. */
@@ -127,7 +135,7 @@ export function renderReport(report: StatusReport, now: number): string[] {
   lines.push(`totals rounds=${report.rounds} dispatched=${report.dispatched} suppressed=${report.suppressed} skipped=${report.skipped} unclaimed=${report.unclaimed} reclaimed=${report.reclaimed}`)
   if (report.caller !== undefined) {
     const live = report.caller
-    lines.push(`caller team=${live.team} tasks=${live.tasks} inFlight=${live.inFlight} claimable=${live.claimable} idle=${live.idle} slots=${live.slots} (live)`)
+    lines.push(`caller team=${live.team} tasks=${live.tasks} inFlight=${live.inFlight} claimable=${live.claimable} blocked=${live.blocked} done=${live.done} idle=${live.idle} slots=${live.slots} (live)`)
   }
   lines.push(`teams=${report.teams.length}`)
   for (const team of report.teams) {
@@ -137,12 +145,18 @@ export function renderReport(report: StatusReport, now: number): string[] {
       + ` skipped=${team.skipped} (scope=${team.skippedScope} noMember=${team.skippedNoMember} declined=${team.skippedDeclined})`
       + ` breaker=${team.breaker} trips=${team.breakerTrips} held=${team.breakerBlocked}`
       + ` reclaimed=${team.reclaimed} unclaimed=${team.unclaimed}`
-      + ` tasks=${team.tasks} inFlight=${team.inFlight} claimable=${team.claimable} idle=${team.idle} slots=${team.slots} (${age})`,
+      + ` tasks=${team.tasks} inFlight=${team.inFlight} claimable=${team.claimable} blocked=${team.blocked} done=${team.done} idle=${team.idle} slots=${team.slots} (${age})`,
     )
     // The last two decisions, spelled out. A counter says "something happened
     // twice"; these say which task, from/to whom, and how long ago — the whole
     // difference between recognising a loop and guessing at one.
-    if (team.lastReclaim !== undefined) {
+    //
+    // "none" is printed rather than the line being skipped: an absent line and
+    // a version that cannot report it at all look identical to a reader, which
+    // is exactly the ambiguity an operator cannot afford.
+    if (team.lastReclaim === undefined) {
+      lines.push('    lastReclaim none')
+    } else {
       const reclaim = team.lastReclaim
       lines.push(
         `    lastReclaim task=${reclaim.taskId} from=${reclaim.previousOwner}`
@@ -153,7 +167,9 @@ export function renderReport(report: StatusReport, now: number): string[] {
         + ` (${Math.max(0, now - reclaim.at)}ms ago)`,
       )
     }
-    if (team.lastDispatch !== undefined) {
+    if (team.lastDispatch === undefined) {
+      lines.push('    lastDispatch none')
+    } else {
       const dispatch = team.lastDispatch
       const outcome = dispatch.claimed === undefined
         ? 'not-checked-yet'

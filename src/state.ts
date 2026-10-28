@@ -122,6 +122,10 @@ export interface TeamState {
   inFlight: number
   /** Ready, unowned tasks at the team's last tick. */
   claimable: number
+  /** Unowned tasks waiting on their dependencies at the team's last tick. */
+  blocked: number
+  /** Finished tasks at the team's last tick. */
+  done: number
   /** Idle teammates at the team's last tick. */
   idle: number
   /** Free concurrency slots at the team's last tick. */
@@ -205,6 +209,8 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     tasks: 0,
     inFlight: 0,
     claimable: 0,
+    blocked: 0,
+    done: 0,
     idle: 0,
     slots: 0,
     lastTickAt: undefined,

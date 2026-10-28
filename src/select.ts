@@ -149,6 +149,10 @@ export interface BoardSummary {
   readonly inFlight: number
   /** Ready, unowned tasks that could be handed out right now. */
   readonly claimable: number
+  /** Unowned, unready tasks: waiting on their dependencies. */
+  readonly blocked: number
+  /** Tasks that are finished with, one way or the other. */
+  readonly done: number
   /** Teammates eligible to take new work. */
   readonly idle: number
   /** Free concurrency slots. */
@@ -161,6 +165,13 @@ export interface BoardSummary {
  * The in-flight rule is shared with {@link planDispatch} through
  * {@link isInFlight}, so a reported `inFlight` and `slots` always match the
  * decision the autopilot actually made.
+ *
+ * The four task buckets partition the board exactly:
+ * `inFlight + claimable + blocked + done === tasks`. That is what makes the
+ * numbers diagnostic rather than merely descriptive: "4 tasks, 0 claimable" is
+ * a puzzle, while "4 tasks, 2 blocked, 2 done" answers it. `blocked` counts
+ * unowned `pending` tasks that are not ready — waiting on a dependency, not on
+ * a member.
  * @param tasks - current board.
  * @param members - current roster.
  * @param maxConcurrent - effective concurrency budget for the team.
@@ -172,10 +183,14 @@ export function boardSummary(
   maxConcurrent: number,
 ): BoardSummary {
   const inFlight = tasks.filter(isInFlight).length
+  const claimable = claimableTasks(tasks).length
+  const done = tasks.filter(task => task.status === 'completed' || task.status === 'deleted').length
   return {
     tasks: tasks.length,
     inFlight,
-    claimable: claimableTasks(tasks).length,
+    claimable,
+    blocked: tasks.length - inFlight - claimable - done,
+    done,
     idle: availableMembers(members, tasks).length,
     slots: Math.max(0, maxConcurrent - inFlight),
   }

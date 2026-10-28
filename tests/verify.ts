@@ -31,7 +31,7 @@ import { renderReport } from '../src/report.ts'
 import type { StatusReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { planReclaim } from '../src/reclaim.ts'
-import { statusLine } from '../src/observe.ts'
+import { startupLine, statusLine } from '../src/observe.ts'
 import { teamState } from '../src/state.ts'
 import { createAutopilotState } from '../src/state.ts'
 
@@ -477,6 +477,52 @@ test('boardSummary counts a completed task as holding no slot', () => {
   assert.equal(summary.idle, 1)
 })
 
+test('boardSummary partitions the board into flight, ready, blocked and done', () => {
+  const board = [
+    task({ id: 't1', status: 'in_progress', ownerName: 'alice' }),
+    // Owner-claimed but not started: holds a slot, cannot be handed out again.
+    task({ id: 't2', status: 'pending', ownerName: 'bob' }),
+    task({ id: 't3', status: 'pending', ready: true }),
+    // Waiting on t1, so not ready and not dispatcheable. The blocker id is
+    // branded at the type level; the runtime only ever reads it as a string.
+    task({ id: 't4', status: 'pending', ready: false, blockedBy: ['t1' as never] }),
+    task({ id: 't5', status: 'completed', ownerName: 'alice' }),
+    task({ id: 't6', status: 'deleted' }),
+  ]
+  const summary = boardSummary(board, [member('alice', 'running'), member('bob', 'running')], 4)
+  assert.equal(summary.tasks, 6)
+  assert.equal(summary.inFlight, 2)
+  assert.equal(summary.claimable, 1)
+  assert.equal(summary.blocked, 1)
+  assert.equal(summary.done, 2)
+  // The four buckets are a partition, not a loose set of counters: this is what
+  // makes "4 tasks, 0 claimable" readable as "2 blocked, 2 finished".
+  assert.equal(summary.inFlight + summary.claimable + summary.blocked + summary.done, summary.tasks)
+})
+
+test('startupLine names the build and the settings it is running with', () => {
+  const config = {
+    enabled: true,
+    tickTimeoutMs: 30_000,
+    maxConcurrent: 2,
+    wakeCooldownMs: 60_000,
+    dryRun: false,
+    teamBudgets: {},
+    errorThreshold: 3,
+    openCooldownMs: 60_000,
+    halfOpenProbe: 1,
+    reclaimAfterMs: 300_000,
+    reclaimOnFailed: true,
+    statusFile: 'C:/tmp/status.log',
+    statusHeartbeatMs: 600_000,
+  }
+  const line = startupLine(0, config)
+  assert.match(line, /^1970-01-01T00:00:00\.000Z autopilot-start /)
+  assert.match(line, /tickMs=30000 wakeMs=60000 reclaimMs=300000 heartbeatMs=600000 dryRun=false$/)
+  // A restart is only diagnosable if the line says which build came back.
+  assert.match(line, /version=\d+\.\d+\.\d+ /)
+})
+
 test('renderReport separates the caller\'s live board from per-team snapshots', () => {
   const report: StatusReport = {
     enabled: true,
@@ -505,6 +551,8 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         tasks: 1,
         inFlight: 1,
         claimable: 0,
+        blocked: 0,
+        done: 0,
         idle: 0,
         slots: 1,
         lastTickAt: 1_000,
@@ -515,6 +563,8 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
       tasks: 1,
       inFlight: 1,
       claimable: 0,
+      blocked: 0,
+      done: 0,
       idle: 0,
       slots: 1,
     },
@@ -527,6 +577,10 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
   // The caller's board is marked live, the per-team row carries its age.
   assert.match(text, /caller team=team-a .*\(live\)/)
   assert.match(text, /team=team-a ticks=3 .*\(2000ms ago\)/)
+  // "none" rather than silence: an absent line is indistinguishable from a
+  // build that never learned to report the field at all.
+  assert.match(text, /lastReclaim none/)
+  assert.match(text, /lastDispatch none/)
 })
 
 test('renderReport names the last reclaim and dispatch instead of only counting them', () => {
@@ -557,6 +611,8 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         tasks: 3,
         inFlight: 0,
         claimable: 1,
+        blocked: 0,
+        done: 1,
         idle: 2,
         slots: 2,
         lastTickAt: 2_000,
@@ -674,6 +730,9 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   team.unclaimed = 1
   team.tasks = 2
   team.claimable = 1
+  // 2 tasks = 0 in flight + 1 ready + 1 waiting on a dependency + 0 done.
+  team.blocked = 1
+  team.done = 0
   team.idle = 2
   team.slots = 2
 
@@ -683,7 +742,7 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   assert.match(idle, /^1970-01-01T00:00:00\.000Z team=team-a /)
   assert.match(idle, /ticks=3 dispatched=1 suppressed=0 /)
   assert.match(idle, /skip=2 scope=1 noMember=0 declined=1 /)
-  assert.match(idle, /unclaimed=1 reclaimed=0 tasks=2 inFlight=0 claimable=1 idle=2 slots=2 /)
+  assert.match(idle, /unclaimed=1 reclaimed=0 tasks=2 inFlight=0 claimable=1 blocked=1 done=0 idle=2 slots=2 /)
   assert.match(idle, /breaker=closed trips=0 held=0$/)
   assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
 
