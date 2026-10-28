@@ -183,6 +183,8 @@ grep -ri "team-autopilot" ~/.dsh/profiles/desktop/.plugin-manager/logs | tail -2
 
 ## 5. 真实派发验证（最后做，`dryRun: false`）
 
+**现成的粘贴提示词见 [`prompts-dispatch.md`](prompts-dispatch.md)** ——它把「只建任务、别的一概不做」写死了，因为这次要证明的正是「没有模型动作时插件自己派出去了」；Lead 顺手认领或通知成员，证据就没了。
+
 1. 成员端应收到形如以下格式的消息（subject 已折叠空白、按码位截断 80、反引号被中和为 `'`，首个反引号对是固定围栏）：
 
    ```
