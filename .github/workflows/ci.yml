@@ -30,6 +30,15 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Everything below is deliberately runnable without the DSH host: the
+      # pure core (`select.ts` / `breaker.ts` / `stall.ts` / `observe.ts` /
+      # `budget.ts`) has no runtime imports, and `dispatch.ts` never imports
+      # `dsh-tools`. The host is simulated by a stub in `tests/integration.ts`.
+      #
+      # `scripts/verify-mount.mjs` is not run here: it needs a real DSH profile
+      # directory on disk (it resolves a profile by name), so it stays an
+      # operator-run check.
+
       - run: pnpm run typecheck
 
       - run: pnpm run build

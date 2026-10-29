@@ -4,19 +4,15 @@
 # ctx.agentTeams, i.e. @deepseek-ai/dsh-experimental-agent-team-profile (or any
 # composition mounting @deepseek-ai/dsh-experimental-agent-team).
 # Without it the plugin's `inject` cannot resolve and the plugin will not load.
+#
+# Only `enabled` is pinned here. Every other setting comes from the plugin's own
+# schema defaults, which is the one place those numbers are defined: a copy in
+# this patch drifts the moment a default moves, and a stale copy here silently
+# overrides the operator's own intent. To change a setting, override this entry
+# by id in your profile's cordis.patch.yml (see README「配置」).
 
 - insert:
     - id: team-autopilot
       name: dsh-team-autopilot
       config:
         enabled: true
-        tickTimeoutMs: 30000
-        maxConcurrent: 2
-        wakeCooldownMs: 60000
-        dryRun: false
-        teamBudgets: {}
-        errorThreshold: 3
-        openCooldownMs: 60000
-        halfOpenProbe: 1
-        reclaimAfterMs: 300000
-        reclaimOnFailed: true

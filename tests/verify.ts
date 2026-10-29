@@ -26,15 +26,19 @@ import {
 } from '../src/breaker.ts'
 import type { BreakerConfig } from '../src/breaker.ts'
 import { findLeads } from '../src/lead.ts'
-import { boardSummary } from '../src/select.ts'
-import { renderReport } from '../src/report.ts'
+import { boardSummary, callerBoard } from '../src/select.ts'
+import { formatUptime, healthOf, renderReport } from '../src/report.ts'
 import { toTeamReport } from '../src/report.ts'
-import type { StatusReport } from '../src/report.ts'
+import type { StatusReport, TeamReport } from '../src/report.ts'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { planReclaim } from '../src/reclaim.ts'
-import { startupLine, statusLine, statusSignature } from '../src/observe.ts'
+import { planStallWatch } from '../src/stall.ts'
+import { createLiveness } from '../src/liveness.ts'
+import { appendStatusLineWith, startupLine, statusLine, statusSignature } from '../src/observe.ts'
 import { teamState } from '../src/state.ts'
 import { createAutopilotState } from '../src/state.ts'
+import { forgetMissing, pruneWakeMap } from '../src/dispatch.ts'
+import { WAKE_WINDOW_MS, pruneWakeStamps, wakeAllowance } from '../src/budget.ts'
 
 /** Build one task view with sane defaults. `id` stays a plain string here. */
 function task(over: Omit<Partial<TeamTaskView>, 'id'> & { id: string }): TeamTaskView {
@@ -69,6 +73,19 @@ const failures: string[] = []
 function test(label: string, body: () => void): void {
   try {
     body()
+    passed += 1
+  } catch (error: unknown) {
+    failures.push(`${label} → ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * Async twin of {@link test}. The log trim is filesystem work, so the one test
+ * that covers it cannot be driven inline like the pure functions.
+ */
+async function testAsync(label: string, body: () => Promise<void>): Promise<void> {
+  try {
+    await body()
     passed += 1
   } catch (error: unknown) {
     failures.push(`${label} → ${error instanceof Error ? error.message : String(error)}`)
@@ -155,6 +172,218 @@ test('planDispatch fills slots up to maxConcurrent', () => {
   assert.equal(width2.plans.length, 2)
   const width1 = planDispatch({ tasks: board, members, maxConcurrent: 1 })
   assert.equal(width1.plans.length, 1)
+})
+
+test('planDispatch treats an unclaimed wake as a committed slot', () => {
+  // Slots used to count only in-flight work, so a round that had just woken two
+  // members still saw both slots free until they claimed. On a board with more
+  // ready tasks than members that re-woke the same pool every tick.
+  const board = [task({ id: 't1' }), task({ id: 't2' }), task({ id: 't3' })]
+  const members = [
+    member('alice', 'inactive'),
+    member('bob', 'inactive'),
+    member('carol', 'inactive'),
+  ]
+  const free = planDispatch({ tasks: board, members, maxConcurrent: 2 })
+  assert.equal(free.plans.length, 2)
+  const reserved = planDispatch({ tasks: board, members, maxConcurrent: 2, reserved: 2 })
+  assert.equal(reserved.plans.length, 0)
+  // One wake outstanding still leaves exactly one real slot.
+  const half = planDispatch({ tasks: board, members, maxConcurrent: 2, reserved: 1 })
+  assert.equal(half.plans.length, 1)
+})
+
+test('boardSummary subtracts reserved wakes from slots', () => {
+  const board = [task({ id: 't1' })]
+  const members = [member('alice', 'inactive')]
+  assert.equal(boardSummary(board, members, 2).slots, 2)
+  assert.equal(boardSummary(board, members, 2, undefined, 1).slots, 1)
+  // Clamped at zero: an outstanding wake can outnumber the budget briefly when
+  // the budget was lowered, and a negative slot count would read as free room.
+  assert.equal(boardSummary(board, members, 2, undefined, 5).slots, 0)
+})
+
+test('planStallWatch never judges a task the first time it sees it', () => {
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const members = [member('alice', 'running')]
+  const first = planStallWatch({
+    tasks: board,
+    members,
+    now: 1_000,
+    stalledAfterMs: 900_000,
+    seen: new Map(),
+  })
+  // No history yet: the turn may have started long before the task was claimed,
+  // and charging that earlier time to this task would cancel honest work.
+  assert.equal(first.warnings.length, 0)
+  assert.equal(first.seen.get('t1')?.since, 1_000)
+  const later = planStallWatch({
+    tasks: board,
+    members,
+    now: 800_000,
+    stalledAfterMs: 900_000,
+    seen: first.seen,
+  })
+  assert.equal(later.warnings.length, 0)
+  const over = planStallWatch({
+    tasks: board,
+    members,
+    now: 901_000,
+    stalledAfterMs: 900_000,
+    seen: later.seen,
+  })
+  assert.equal(over.warnings.length, 1)
+  assert.equal(over.warnings[0]?.taskId, 't1')
+  assert.equal(over.warnings[0]?.ownerName, 'alice')
+  assert.equal(over.warnings[0]?.forMs, 900_000)
+  assert.equal(over.warnings[0]?.interruptible, true)
+  assert.match(over.warnings[0]?.reason ?? '', /has been running 900000ms without finishing/)
+})
+
+test('planStallWatch reports a provisioning owner but will not interrupt it', () => {
+  // A member whose turn has not started yet has nothing to cancel; reporting it
+  // is still the point, because it holds its slot while looking alive.
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const members = [member('alice', 'provisioning')]
+  const first = planStallWatch({
+    tasks: board,
+    members,
+    now: 0,
+    stalledAfterMs: 1_000,
+    seen: new Map(),
+  })
+  const second = planStallWatch({
+    tasks: board,
+    members,
+    now: 2_000,
+    stalledAfterMs: 1_000,
+    seen: first.seen,
+  })
+  assert.equal(second.warnings.length, 1)
+  assert.equal(second.warnings[0]?.status, 'provisioning')
+  assert.equal(second.warnings[0]?.interruptible, false)
+  assert.match(second.warnings[0]?.reason ?? '', /has been provisioning/)
+})
+
+test('planStallWatch restarts its window when the turn restarts', () => {
+  // The owner was busy on something else, went idle, then picked this task up.
+  // The new turn is the only honest start for *this* task's window.
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const members = [member('alice', 'running')]
+  const liveness = createLiveness()
+  liveness.mark('alice', 'running', 500_000)
+  const first = planStallWatch({
+    tasks: board,
+    members,
+    now: 600_000,
+    stalledAfterMs: 300_000,
+    seen: new Map(),
+    liveness,
+  })
+  assert.equal(first.seen.get('t1')?.since, 600_000)
+  // Same turn, still running: the window stays put and eventually fires.
+  const carried = planStallWatch({
+    tasks: board,
+    members,
+    now: 700_000,
+    stalledAfterMs: 300_000,
+    seen: first.seen,
+    liveness,
+  })
+  assert.equal(carried.seen.get('t1')?.since, 600_000)
+  assert.equal(carried.warnings.length, 0)
+  const fired = planStallWatch({
+    tasks: board,
+    members,
+    now: 900_000,
+    stalledAfterMs: 300_000,
+    seen: carried.seen,
+    liveness,
+  })
+  assert.equal(fired.warnings.length, 1)
+  // A new turn after an idle gap pushes the window forward instead.
+  liveness.mark('alice', 'idle', 950_000)
+  liveness.mark('alice', 'running', 1_000_000)
+  const restarted = planStallWatch({
+    tasks: board,
+    members,
+    now: 1_050_000,
+    stalledAfterMs: 300_000,
+    seen: fired.seen,
+    liveness,
+  })
+  assert.equal(restarted.seen.get('t1')?.since, 1_000_000)
+  assert.equal(restarted.warnings.length, 0)
+})
+
+test('planStallWatch carries an interrupt forward instead of re-reporting it', () => {
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const members = [member('alice', 'running')]
+  const seen = new Map([['t1', { since: 0, interruptedAt: 5_000 }]])
+  const result = planStallWatch({
+    tasks: board,
+    members,
+    now: 10_000,
+    stalledAfterMs: 1_000,
+    seen,
+  })
+  // Still reported — it is still wedged — but the interrupt is a fact the caller
+  // can see, so it does not cancel the same turn twice while the member writes
+  // the terminal status the first interrupt caused.
+  assert.equal(result.warnings.length, 1)
+  assert.equal(result.warnings[0]?.interruptedAt, 5_000)
+  assert.equal(result.seen.get('t1')?.interruptedAt, 5_000)
+})
+
+test('planStallWatch grants a fresh interrupt after the member starts a new turn', () => {
+  // Interrupted once. The member then starts another turn on the same task and
+  // stalls again: carrying the old `interruptedAt` forward would make "only
+  // interrupt once" mean "only interrupt once per process", and the second
+  // stall would be reported forever without ever being cleared.
+  const board = [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })]
+  const members = [member('alice', 'running')]
+  const liveness = createLiveness()
+  liveness.mark('alice', 'running', 20_000)
+  const result = planStallWatch({
+    tasks: board,
+    members,
+    now: 30_000,
+    stalledAfterMs: 1_000,
+    seen: new Map([['t1', { since: 0, interruptedAt: 5_000 }]]),
+    liveness,
+  })
+  assert.equal(result.warnings.length, 1)
+  assert.equal(result.warnings[0]?.since, 20_000, 'the new turn is the new window')
+  assert.equal(result.warnings[0]?.interruptedAt, undefined, 'so it may be interrupted again')
+  assert.equal(result.seen.get('t1')?.interruptedAt, undefined)
+})
+
+test('planStallWatch ignores idle owners, the Lead, and a zero window', () => {
+  const board = [
+    task({ id: 't1', status: 'in_progress', ownerName: 'alice' }),
+    task({ id: 't2', status: 'in_progress', ownerName: 'boss' }),
+  ]
+  const members = [member('alice', 'inactive'), member('boss', 'running', 'lead')]
+  const idle = planStallWatch({
+    tasks: board,
+    members,
+    now: 10_000,
+    stalledAfterMs: 1_000,
+    seen: new Map([['t1', { since: 0 }], ['t2', { since: 0 }]]),
+  })
+  // An inactive owner is reclaim's business, a Lead is nobody's to cancel.
+  assert.equal(idle.warnings.length, 0)
+  assert.equal(idle.seen.size, 0)
+  // Zero disables the watch and drops the table, so turning it off costs nothing.
+  const off = planStallWatch({
+    tasks: board,
+    members: [member('alice', 'running')],
+    now: 10_000,
+    stalledAfterMs: 0,
+    seen: new Map([['t1', { since: 0 }]]),
+  })
+  assert.equal(off.warnings.length, 0)
+  assert.equal(off.seen.size, 0)
 })
 
 test('planDispatch subtracts in-flight work from the budget', () => {
@@ -333,8 +562,7 @@ test('breaker blocks dispatch while open, half-opens after cooldown', () => {
   assert.equal(cooled.canDispatch, true)
 })
 
-test('half-open closes after probe dispatches all succeed', () => {
-  let b = createBreaker()
+test('half-open closes after probe dispatches all succeed', () => {  let b = createBreaker()
   b = recordError(b, 0, bcfg)
   b = recordError(b, 0, bcfg)
   b = recordError(b, 0, bcfg)
@@ -345,6 +573,27 @@ test('half-open closes after probe dispatches all succeed', () => {
   assert.equal(b.state, 'halfOpen')
   b = recordSuccess(b)
   assert.equal(b.state, 'closed')
+})
+
+test('a half-open breaker with no probe left closes instead of latching forever', () => {
+  // Reached by `halfOpenProbe: 0` — the schema rejects it, but a config that
+  // bypassed validation can still deliver it, and the result is unrecoverable:
+  // nothing dispatches, so no success is ever recorded, so `halfOpenRemaining`
+  // can never move. The team would sit there forever while the breaker claimed
+  // to be probing.
+  const latched = {
+    state: 'halfOpen' as const,
+    consecutiveErrors: 0,
+    openedAt: undefined,
+    halfOpenRemaining: 0,
+  }
+  const next = evaluate(latched, 0, bcfg)
+  assert.equal(next.breaker.state, 'closed')
+  assert.equal(next.canDispatch, true)
+  // And a breaker that still has a probe left keeps the old behaviour.
+  const probing = evaluate({ ...latched, halfOpenRemaining: 1 }, 0, bcfg)
+  assert.equal(probing.breaker.state, 'halfOpen')
+  assert.equal(probing.canDispatch, true)
 })
 
 test('any error during half-open re-opens immediately', () => {
@@ -553,8 +802,34 @@ test('boardSummary splits a parked task out of claimable', () => {
   )
 })
 
-test('planDispatch still reports why tasks after the last slot were skipped', () => {
-  // M2: a `break` at capacity used to swallow the skip reasons of every task
+test('callerBoard folds parking and promised slots into the live view', () => {
+  // The status tool's top line is a live board. It used to be computed without
+  // the parked map, so a task parked after repeated reclaims still counted as
+  // `claimable` there while the team line in the same report said `parked=1`
+  // for that very task — one report contradicting itself.
+  const board = [
+    task({ id: 't1', status: 'pending', ready: true }),
+    task({ id: 't2', status: 'pending', ready: true }),
+  ]
+  const members = [member('lead', 'running', 'lead'), member('alice', 'inactive')]
+  const bucket = {
+    // ParkRecord-shaped on purpose: this is the state's real value type.
+    parked: new Map([['t1', { taskId: 't1', reclaims: 3, previousOwner: 'alice', at: 1 }]]),
+    pendingWakes: new Map([['t2', { memberName: 'alice', at: 2 }]]),
+  }
+  const summary = callerBoard(board, members, 2, bucket)
+  assert.equal(summary.parked, 1, 'the parked task is its own bucket, not claimable')
+  assert.equal(summary.claimable, 1, 'only t2 is still up for grabs')
+  assert.equal(summary.slots, 1, 't2 is promised to a wake nobody answered yet')
+  // A team the loop has never ticked has no memory to fold in, and must not
+  // pretend otherwise.
+  const cold = callerBoard(board, members, 2, undefined)
+  assert.equal(cold.claimable, 2)
+  assert.equal(cold.parked, 0)
+  assert.equal(cold.slots, 2)
+})
+
+test('planDispatch still reports why tasks after the last slot were skipped', () => {  // M2: a `break` at capacity used to swallow the skip reasons of every task
   // that sat after the one filling the last slot, so `why=` read "nothing
   // skipped" while parked/colliding work stood just out of view. Filling the
   // last slot must stop dispatch, not the walk.
@@ -629,12 +904,22 @@ test('startupLine names the build and the settings it is running with', () => {
     reclaimRetryLimit: 3,
     statusFile: 'C:/tmp/status.log',
     statusHeartbeatMs: 600_000,
+    livenessEnabled: true,
+    livenessGraceMs: 60_000,
+    livenessSettleGraceMs: 3_000,
+    stalledRunningMs: 900_000,
+    interruptStalled: false,
+    wakeBudgetPerHour: 0,
   }
   const line = startupLine(0, config)
   assert.match(line, /^1970-01-01T00:00:00\.000Z autopilot-start /)
   // The reclaim limit belongs here: a `parks=` in the log cannot be read
-  // without the limit that produced it, and a restart is when it changes.
-  assert.match(line, /reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3$/)
+  // without the limit that produced it, and a restart is when it changes. The
+  // stall window belongs here for the same reason, and `interrupt=` because it
+  // decides whether a `stalls=` line means "reported" or "cancelled". The
+  // budget is here because every `budget=` in the body reads `off` when it is
+  // unset, which is also what a build without the field would look like.
+  assert.match(line, /reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3 liveness=on livenessMs=60000 livenessSettleMs=3000 stalledMs=900000 interrupt=off wakeBudget=off$/)
   // A restart is only diagnosable if the line says which build came back.
   assert.match(line, /version=\d+\.\d+\.\d+ /)
 })
@@ -643,6 +928,9 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
   const report: StatusReport = {
     enabled: true,
     dryRun: false,
+    version: 'test-build',
+    uptimeMs: 120_000,
+    health: 'ok',
     rounds: 3,
     dispatched: 2,
     suppressed: 1,
@@ -650,6 +938,8 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
     unclaimed: 0,
     reclaimed: 0,
     parked: 0,
+    stalled: 0,
+    stallInterrupts: 0,
     teams: [
       {
         team: 'team-a',
@@ -661,6 +951,7 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         skippedNoMember: 0,
         skippedDeclined: 0,
         skippedParked: 0,
+        skippedBudget: 0,
         why: [],
         unclaimed: 0,
         pending: 0,
@@ -669,6 +960,10 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         breakerBlocked: 0,
         reclaimed: 0,
         parked: [],
+        stalled: 0,
+        stallWarnings: 0,
+        stallInterrupts: 0,
+        statusWriteFailed: false,
         tasks: 1,
         inFlight: 1,
         claimable: 0,
@@ -676,14 +971,17 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
         done: 0,
         idle: 0,
         slots: 1,
+        wakesThisHour: 0,
+        wakeBudget: 0,
         lastTickAt: 1_000,
       },
     ],
     caller: {
       team: 'team-a',
-      tasks: 1,
+      tasks: 2,
       inFlight: 1,
       claimable: 0,
+      parked: 1,
       blocked: 0,
       done: 0,
       idle: 0,
@@ -691,17 +989,27 @@ test('renderReport separates the caller\'s live board from per-team snapshots', 
     },
   }
   const text = renderReport(report, 3_000).join('\n')
-  assert.match(text, /autopilot active/)
+  assert.match(text, /^autopilot active health=ok version=test-build up=2m$/m)
   // Totals and the per-team breakdown are labelled separately.
   assert.match(text, /totals rounds=3 dispatched=2 suppressed=1/)
   assert.match(text, /teams=1/)
   // The caller's board is marked live, the per-team row carries its age.
   assert.match(text, /caller team=team-a .*\(live\)/)
+  // The parked bucket is named on the caller's line too. A parked task is
+  // ready and unowned on the board, so without this count the live numbers
+  // stop partitioning `tasks` and give no hint where the difference went.
+  assert.match(
+    text,
+    /caller team=team-a tasks=2 inFlight=1 claimable=0 parked=1 blocked=0 done=0 idle=0 slots=1 \(live\)/,
+  )
   assert.match(text, /team=team-a ticks=3 .*\(2000ms ago\)/)
   // "none" rather than silence: an absent line is indistinguishable from a
   // build that never learned to report the field at all.
   assert.match(text, /lastReclaim none/)
   assert.match(text, /lastDispatch none/)
+  // Same convention for stalls: "nothing wedged" is a fact worth printing,
+  // because its absence is otherwise indistinguishable from an old build.
+  assert.match(text, /lastStall none/)
   // The same `why=` the log line carries, and the same `-` for "no skip":
   // status used to report only the lifetime counters here, which cannot say
   // why nothing moved in the round they were just read after.
@@ -712,6 +1020,11 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   const report: StatusReport = {
     enabled: true,
     dryRun: false,
+    version: 'test-build',
+    uptimeMs: 120_000,
+    // Both a stalled slot and a parked task are present below; `stuck` is the
+    // verdict because it outranks `parked` in the triage order.
+    health: 'stuck',
     rounds: 9,
     dispatched: 4,
     suppressed: 5,
@@ -719,6 +1032,8 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
     unclaimed: 2,
     reclaimed: 2,
     parked: 1,
+    stalled: 1,
+    stallInterrupts: 0,
     teams: [
       {
         team: 'team-a',
@@ -730,6 +1045,7 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         skippedNoMember: 0,
         skippedDeclined: 0,
         skippedParked: 0,
+        skippedBudget: 0,
         why: ['scope'],
         unclaimed: 2,
         pending: 1,
@@ -740,6 +1056,10 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         parked: [
           { taskId: 'task-4', reclaims: 3, previousOwner: 'worker-b', at: 2_900 },
         ],
+        stalled: 1,
+        stallWarnings: 2,
+        stallInterrupts: 0,
+        statusWriteFailed: false,
         tasks: 3,
         inFlight: 0,
         claimable: 1,
@@ -747,6 +1067,8 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
         done: 1,
         idle: 2,
         slots: 2,
+        wakesThisHour: 3,
+        wakeBudget: 10,
         lastTickAt: 2_000,
         lastReclaim: {
           taskId: 'task-3',
@@ -763,12 +1085,18 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
           sent: true,
           claimed: false,
         },
+        lastStall: {
+          taskId: 'task-5',
+          ownerName: 'worker-c',
+          forMs: 950_000,
+          at: 2_950,
+        },
       },
     ],
   }
   const text = renderReport(report, 3_000).join('\n')
   // The skip total is broken down, so the four fixes are told apart.
-  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0 parkedSkips=0\)/)
+  assert.match(text, /skipped=1 \(scope=1 noMember=0 declined=0 parkedSkips=0 budgetSkips=0\)/)
   // The breakdown says where the total came from; `why` says what the last
   // round ran into. Both, because they answer different questions.
   assert.match(text, /why=scope /)
@@ -776,6 +1104,13 @@ test('renderReport names the last reclaim and dispatch instead of only counting 
   assert.match(text, /lastReclaim task=task-3 from=worker-a reason='owner "worker-a" inactive for 60012ms' applied \(500ms ago\)/)
   // Which task went to whom, how many times, and whether it was picked up.
   assert.match(text, /lastDispatch task=task-3 to=worker-a wakes=3 sent outcome=unclaimed \(200ms ago\)/)
+  // A wedged turn is named the same way, because the numbers beside it look
+  // healthy: printing only `stalled=1` would leave the reader with no member to
+  // go and look at.
+  assert.match(text, /lastStall task=task-5 owner=worker-c for=950000ms \(50ms ago\)/)
+  // A stalled task gets its own warning: `slots=` alone cannot separate "fully
+  // loaded but working" from "fully loaded and never going to move again".
+  assert.match(text, /warning: 1 task\(s\) held by a member that has not moved/)
   // The loop signature is called out instead of left for the reader to infer.
   assert.match(text, /warning: 2 wakes went unclaimed/)
   // A parked task is spelled out rather than counted: the reader has to be
@@ -927,7 +1262,7 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   // "Nothing was skipped" is printed as `-` rather than omitted: an absent key
   // reads as an older build, not as good news. The four skip counters sit in
   // one block so the cause is readable without the status tool.
-  assert.match(idle, /declined=1 parkedSkips=0 why=- unclaimed=1 /)
+  assert.match(idle, /declined=1 parkedSkips=0 budgetSkips=0 why=- unclaimed=1 /)
   assert.match(idle, /breaker=closed trips=0 held=0$/)
   assert.equal(idle.includes('wake='), false, 'no wake yet, no wake field')
 
@@ -1019,6 +1354,263 @@ test('statusLine stays one greppable line and grows as decisions happen', () => 
   )
 })
 
+test('does not offer a task it is still waiting on, and holds its scope', () => {
+  const members = [member('alice', 'inactive'), member('bob', 'inactive')]
+  const alone = planDispatch({
+    tasks: [task({ id: 'a', status: 'pending', ready: true })],
+    members,
+    maxConcurrent: 2,
+    reserved: 1,
+    pending: new Set(['a']),
+  })
+  assert.deepEqual(alone.plans, [], 'the task it already woke somebody for is not woken again')
+
+  // The unclaimed task's write scope is held for the same reason in-flight work
+  // holds it: the member may be about to claim it and start writing, and the
+  // board would still show the task as unowned.
+  const overlapping = planDispatch({
+    tasks: [
+      task({ id: 'a', status: 'pending', ready: true, writeScopes: ['src/shared'] }),
+      task({ id: 'b', status: 'pending', ready: true, writeScopes: ['src/shared'] }),
+    ],
+    members,
+    maxConcurrent: 2,
+    reserved: 1,
+    pending: new Set(['a']),
+  })
+  assert.deepEqual(overlapping.plans, [], 'nothing overlapping may start while the claim is in the air')
+  assert.equal(overlapping.blocked.length, 1)
+  assert.equal(overlapping.blocked[0]?.kind, 'scope')
+  assert.match(overlapping.blocked[0]?.reason ?? '', /already planned for task a/)
+})
+
+test('forgets per-team bookkeeping once a team is gone', () => {
+  // `loop` keeps four maps keyed by TeamId. A team that disappears must not
+  // leave its rows behind for the life of the process.
+  const wakes = new Map([
+    ['a', new Map<string, number>([['t1', 1]])],
+    ['b', new Map<string, number>()],
+  ])
+  const breakers = new Map([['a', createBreaker()], ['b', createBreaker()]])
+  const failures = new Map([['b', 3]])
+  forgetMissing([wakes, breakers, failures], new Set(['a']))
+  assert.deepEqual([...wakes.keys()], ['a'])
+  assert.deepEqual([...breakers.keys()], ['a'])
+  assert.deepEqual([...failures.keys()], [], 'a team with only a failure counter is forgotten too')
+
+  // A live team keeps everything, including its suppression stamps.
+  forgetMissing([wakes, breakers, failures], new Set(['a', 'b']))
+  assert.equal(wakes.get('a')?.get('t1'), 1)
+})
+
+test('forgets wake stamps that can no longer suppress anything', () => {
+  // A stamp is a promise of "not before this moment". It stops meaning
+  // anything the moment the cooldown has passed (the comparison is
+  // `now - stamp < cooldownMs`) or the task leaves the board. Neither is
+  // noticed while the entry sits there, because the map is only ever looked up
+  // for tasks that are about to be dispatched.
+  const now = 1_000_000
+  const lastWake = new Map<string, number>([
+    ['live', now - 1_000],
+    ['expired', now - 60_000],
+    ['gone', now - 1_000],
+  ])
+  pruneWakeMap(lastWake, [task({ id: 'live' }), task({ id: 'expired' })], now, 60_000)
+  assert.deepEqual([...lastWake.keys()], ['live'], 'an expired stamp and a vanished task both go')
+
+  // Cooldown zero means "no suppression at all", so no stamp can survive it —
+  // which is exactly what the dispatch loop would conclude anyway.
+  const noCooldown = new Map([['live', now]])
+  pruneWakeMap(noCooldown, [task({ id: 'live' })], now, 0)
+  assert.equal(noCooldown.size, 0, 'a zero cooldown keeps no stamps')
+})
+
+test('bounds how many team buckets it remembers', () => {
+  // A bucket carries the counters a human reads to decide what to do next, so
+  // it is kept while the team lives. What it must not do is accumulate one
+  // bucket per team a long-lived host ever created: a test harness or a
+  // session-per-team workflow would grow the status report without bound.
+  const state = createAutopilotState()
+  for (let index = 0; index < 40; index += 1) teamState(state, `team-${index}`)
+  assert.equal(state.teams.size, 32, 'the bucket map is capped')
+  assert.equal(state.teams.has('team-0'), false, 'the least recently ticked buckets go first')
+  assert.equal(state.teams.has('team-39'), true, 'the newest bucket is kept')
+
+  // A live team ticks every round, so it can never be the victim — even while
+  // the map stays full and buckets keep being minted around it.
+  const live = teamState(state, 'live-team')
+  live.lastTickAt = 1_000
+  for (let index = 40; index < 120; index += 1) teamState(state, `team-${index}`)
+  assert.equal(state.teams.size, 32)
+  assert.equal(state.teams.has('live-team'), true, 'a ticking team is never evicted')
+})
+
+/**
+ * The trim keeps the newest half of a log that outgrew its ceiling. The boot
+ * marker is the one line that must survive: it names the build and the
+ * settings. Carrying it forward is easy to get wrong in two ways — duplicating
+ * it when it already sits in the kept half, and appending a second
+ * ` (trimmed)` note on every later trim. Both leave a file where
+ * `grep autopilot-start` answers "which build is running" with two rows.
+ */
+await testAsync('a trim carries one boot marker, never a growing pile of them', async () => {
+  const boot = '2026-10-29T00:00:00.000Z autopilot-start version=0.5.1 tickMs=30000'
+  const padding = Array.from(
+    { length: 1_300 },
+    (_, index) => `${String(index).padStart(4, '0')} ${'x'.repeat(110)}`,
+  )
+  const bootLines = (text: string): string[] =>
+    text.split('\n').filter(entry => /^\S+ autopilot-start /.test(entry))
+
+  const makeFs = (initial: string) => {
+    const files = new Map<string, string>([['/status.log', initial]])
+    return {
+      files,
+      ops: {
+        append: async (path: string, data: string) => {
+          files.set(path, (files.get(path) ?? '') + data)
+        },
+        stat: async (path: string) => ({ size: (files.get(path) ?? '').length }),
+        read: async (path: string) => files.get(path) ?? '',
+        write: async (path: string, data: string) => {
+          files.set(path, data)
+        },
+        rename: async (from: string, to: string) => {
+          files.set(to, files.get(from) ?? '')
+          files.delete(from)
+        },
+      },
+    }
+  }
+
+  // The marker sits in the half a trim drops, so it is carried forward.
+  const stale = makeFs([boot, ...padding, ''].join('\n'))
+  await appendStatusLineWith('/status.log', '2026-10-29T01:00:00.000Z team=t ticks=9', stale.ops)
+  const carried = bootLines(stale.files.get('/status.log') ?? '')
+  assert.equal(carried.length, 1, 'the trim leaves exactly one boot marker')
+  assert.equal(carried[0]?.endsWith(' (trimmed)'), true, 'the carried marker says it was trimmed')
+  assert.ok((stale.files.get('/status.log') ?? '').length < 140_000, 'the log was actually trimmed')
+
+  // Trimming again must not turn that note into ` (trimmed) (trimmed)`.
+  await appendStatusLineWith('/status.log', 'y'.repeat(70_000), stale.ops)
+  const again = bootLines(stale.files.get('/status.log') ?? '')
+  assert.equal(again.length, 1, 'a second trim still leaves one boot marker')
+  assert.equal(again[0]?.includes('(trimmed) (trimmed)'), false, 'the note never stacks')
+
+  // A restart near the tail leaves the marker inside the kept half; adding a
+  // second copy there would make "which build is running" ambiguous.
+  const fresh = makeFs(
+    [...padding, boot, '2026-10-29T02:00:00.000Z team=t ticks=1', ''].join('\n'),
+  )
+  await appendStatusLineWith('/status.log', '2026-10-29T02:01:00.000Z team=t ticks=2', fresh.ops)
+  const untouched = bootLines(fresh.files.get('/status.log') ?? '')
+  assert.equal(untouched.length, 1, 'a marker already in the kept half is not duplicated')
+  assert.equal(untouched[0]?.endsWith(' (trimmed)'), false, 'and it is left as it was')
+})
+
+test('the report says so when the status file cannot be written', () => {
+  // A broken `statusFile` fails the same way every round and produced no trace
+  // anywhere: the log stayed empty, which reads exactly like a team that did
+  // nothing all day. The tool has to say it out loud, and it has to clear.
+  const bucket = teamState(createAutopilotState(), 'team-w')
+  assert.equal(toTeamReport(bucket).statusWriteFailed, false, 'a fresh team has not failed yet')
+
+  bucket.statusWriteFailed = true
+  const report: StatusReport = {
+    enabled: true,
+    dryRun: false,
+    version: 'test-build',
+    uptimeMs: 120_000,
+    health: 'blind',
+    rounds: 1,
+    dispatched: 0,
+    suppressed: 0,
+    skipped: 0,
+    unclaimed: 0,
+    reclaimed: 0,
+    parked: 0,
+    stalled: 0,
+    stallInterrupts: 0,
+    teams: [toTeamReport(bucket)],
+  }
+  const text = renderReport(report, 1_000).join('\n')
+  assert.equal(toTeamReport(bucket).statusWriteFailed, true, 'the flag survives the mapping')
+  assert.match(text, /warning: statusFile writes are failing/)
+  assert.match(text, /the log will be empty or stale/)
+  assert.match(text, /health=blind/, 'the verdict line agrees with the warning below it')
+})
+test('healthOf names the worst condition, in its stated triage order', () => {
+  // A row built from a fresh bucket, then bent into the one condition under
+  // test. Using the real mapper keeps this test honest about field names: a
+  // rename in `TeamReport` breaks compilation here rather than silently
+  // weakening the assertions.
+  const row = (over: Partial<TeamReport> = {}): TeamReport => ({
+    ...toTeamReport(teamState(createAutopilotState(), 'team-h')),
+    ...over,
+  })
+
+  assert.equal(healthOf(true, []), 'ok', 'nothing to report is not a problem')
+  assert.equal(healthOf(false, [row({ breaker: 'open' })]), 'off', 'a disabled plugin makes every other verdict moot')
+  assert.equal(healthOf(true, [row({ breaker: 'open' })]), 'broken')
+  assert.equal(healthOf(true, [row({ breaker: 'halfOpen' })]), 'ok', 'half-open is still dispatching — probe traffic is not breakage')
+  assert.equal(healthOf(true, [row({ stalled: 1, statusWriteFailed: true })]), 'stuck', 'a wedged slot outranks a dead log')
+  assert.equal(healthOf(true, [row({ statusWriteFailed: true })]), 'blind')
+  assert.equal(healthOf(true, [row({ parked: [{ taskId: 't1', reclaims: 3, previousOwner: 'alice', at: 1 }] })]), 'parked')
+  assert.equal(healthOf(true, [row(), row()]), 'ok', 'healthy teams do not make each other worse')
+})
+test('formatUptime keeps a lifetime readable at a glance', () => {
+  // One unit, no decimals: the only question a lifetime answers is "minutes or
+  // days?", and a reader scanning one line does not want to divide.
+  assert.equal(formatUptime(0), '0s')
+  assert.equal(formatUptime(59_999), '59s')
+  assert.equal(formatUptime(60_000), '1m')
+  assert.equal(formatUptime(17 * 60_000), '17m')
+  assert.equal(formatUptime(60 * 60_000), '1h')
+  assert.equal(formatUptime(6 * 3_600_000 + 59 * 60_000), '6h', 'the smaller unit is dropped, not rounded up')
+  assert.equal(formatUptime(24 * 3_600_000), '1d')
+  assert.equal(formatUptime(3 * 86_400_000 + 3_600_000), '3d')
+  assert.equal(formatUptime(-5), '0s', 'a clock that went backwards must not print a negative age')
+})
+
+test('the wake budget measures the last hour rather than the calendar hour', () => {
+  const now = 10 * WAKE_WINDOW_MS
+  // A stamp exactly one window old is out: the window is half-open, so a busy
+  // hour cannot hold the next hour hostage by one millisecond.
+  assert.deepEqual(pruneWakeStamps([now - WAKE_WINDOW_MS, now - 1], now), [now - 1])
+  // `0` keeps its old meaning: no budget at all, not a budget of zero.
+  assert.equal(wakeAllowance(0, [now - 1, now - 2], now), Number.POSITIVE_INFINITY)
+  assert.equal(wakeAllowance(3, [now - 1, now - 2], now), 1)
+  assert.equal(wakeAllowance(2, [now - 1, now - 2], now), 0, 'a spent budget never goes negative')
+  assert.equal(wakeAllowance(2, [now - 1, now - WAKE_WINDOW_MS - 1], now), 1, 'aged-out wakes stop counting')
+})
+
+test('planDispatch spends the round on the wakes it is allowed, and says why it stopped', () => {
+  const tasks = [
+    task({ id: 'a', writeScopes: ['src/a'] }),
+    task({ id: 'b', writeScopes: ['src/b'] }),
+    task({ id: 'c', writeScopes: ['src/c'] }),
+  ]
+  const members = [member('alice', 'inactive'), member('bob', 'inactive'), member('carol', 'inactive')]
+
+  // An allowance below both the member count and the slot count is binding…
+  const capped = planDispatch({ tasks, members, maxConcurrent: 3, wakeAllowance: 2 })
+  assert.deepEqual(capped.plans.map(plan => plan.taskId), ['a', 'b'])
+  // …and the task it could not reach is reported as the budget's doing, not
+  // as backpressure: a full round would have left it unreported.
+  assert.deepEqual(capped.blocked.map(entry => entry.kind), ['budget'])
+  assert.match(capped.blocked[0]?.reason ?? '', /wakeBudgetPerHour/)
+
+  // A spent budget dispatches nothing but still explains itself.
+  const spent = planDispatch({ tasks, members, maxConcurrent: 3, wakeAllowance: 0 })
+  assert.equal(spent.plans.length, 0)
+  assert.deepEqual(spent.blocked.map(entry => entry.kind), ['budget', 'budget', 'budget'])
+
+  // A budget wide enough not to bind changes nothing, and a full round stays
+  // quiet — the two ways of sending nothing must not be confused.
+  const free = planDispatch({ tasks, members, maxConcurrent: 1, wakeAllowance: 100 })
+  assert.deepEqual(free.plans.map(plan => plan.taskId), ['a'])
+  assert.equal(free.blocked.length, 0, 'a full round is not a reason to report a task')
+})
 if (failures.length > 0) {
   console.error(`FAILED ${failures.length}`)
   for (const line of failures) console.error(`  - ${line}`)

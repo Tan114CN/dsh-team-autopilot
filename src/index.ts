@@ -20,10 +20,12 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { loop } from './dispatch.ts'
 import { createAutopilotState } from './state.ts'
 import type { AutopilotState } from './state.ts'
-import { boardSummary } from './select.ts'
+import { callerBoard } from './select.ts'
 import { resolveBudget } from './breaker.ts'
-import { renderReport, toTeamReport } from './report.ts'
+import { createLiveness, trackLiveness } from './liveness.ts'
+import { renderReport, healthOf, toTeamReport } from './report.ts'
 import type { LiveBoard, StatusReport, TeamReport } from './report.ts'
+import { version } from './observe.ts'
 
 /** Cordis plugin name. */
 export const name = 'team-autopilot'
@@ -79,6 +81,74 @@ export interface Config {
    * happening" distinguishable from "the autopilot died".
    */
   readonly statusHeartbeatMs?: number
+  /**
+   * Whether to watch `agent/status` for turn boundaries.
+   *
+   * Two decisions wait for a teammate to react: whether a wake was answered,
+   * and whether an owner has stalled. With this on they are settled by an
+   * observed `running` → `idle` transition; with it off they fall back to
+   * `wakeCooldownMs` and `reclaimAfterMs` alone, which is how the autopilot
+   * behaved before liveness existed. Turning it off never makes a decision
+   * faster, only less certain.
+   */
+  readonly livenessEnabled?: boolean
+  /**
+   * How long an owner may stay quiet after its turn ended before the task is
+   * reclaimed (ms).
+   *
+   * Much shorter than `reclaimAfterMs`, and safely so: that window is long
+   * because `inactive` alone cannot tell "never started" from "between
+   * turns". An observed turn end has already answered that, so what is left
+   * to cover is only a follow-up turn, not a possible first one.
+   */
+  readonly livenessGraceMs?: number
+  /**
+   * Lag allowed between a turn ending and the claim becoming visible (ms).
+   *
+   * A turn end is proof the member has finished reacting, but the `claim` it
+   * wrote during that turn is persisted on its own path and may land a moment
+   * later. Judging at the same instant would read a member that did claim as
+   * one that refused — the exact false alarm this feature exists to remove.
+   */
+  readonly livenessSettleGraceMs?: number
+  /**
+   * How long an owner may stay busy on one task before it is reported (ms).
+   *
+   * The counterpart to `reclaimAfterMs`. Reclaim only touches an owner that is
+   * *not* working on its task: `inactive`, `failed`, or gone. A `running` owner
+   * is never reclaimed, because there is no duration after which a turn is
+   * provably dead — and that is exactly the state a wedged turn hides in. This
+   * window is how long one may last before the autopilot says so.
+   *
+   * Purely an observation: the report and the status line grow a stall entry,
+   * nothing is released. `0` disables the watch.
+   */
+  readonly stalledRunningMs?: number
+  /**
+   * Whether a stalled `running` turn is interrupted.
+   *
+   * Off by default, on purpose. Interrupting cancels live work, and a long turn
+   * is usually a big task, not a bug — a wrong interrupt costs a teammate's
+   * whole afternoon, while a missed one costs an idle slot until a human looks.
+   * With it on, the autopilot cancels the member's turn once per stall; the
+   * member then reads `inactive` and the ordinary reclaim path finishes the
+   * job. Never acts under `dryRun`.
+   */
+  readonly interruptStalled?: boolean
+  /**
+   * Wakes (model turns) this plugin may start per team in one rolling hour.
+   *
+   * The only thing here that costs money is a wake, and until this existed the
+   * only ceilings were per task: `wakeCooldownMs` bounds re-wakes of one task
+   * and `reclaimRetryLimit` bounds one task's retry loop. Twenty ready tasks
+   * against five idle members could still start twenty turns, and start twenty
+   * more the next hour, with nothing to say so.
+   *
+   * `0` (the default) leaves the budget off. When set, a round that has spent
+   * it dispatches nothing and reports `why=budget` — a deliberate stop, not a
+   * fault, which is why it gets its own skip counter.
+   */
+  readonly wakeBudgetPerHour?: number
 }
 
 /** Loader schema. */
@@ -97,6 +167,12 @@ export const Config: z<Config> = z.object({
   reclaimRetryLimit: z.number().step(1).min(0).max(32).default(3),
   statusFile: z.string().default(''),
   statusHeartbeatMs: z.number().step(1).min(0).default(600_000),
+  livenessEnabled: z.boolean().default(true),
+  livenessGraceMs: z.number().step(1).min(1_000).max(3_600_000).default(60_000),
+  livenessSettleGraceMs: z.number().step(1).min(0).max(600_000).default(3_000),
+  stalledRunningMs: z.number().step(1).min(0).max(3_600_000).default(900_000),
+  interruptStalled: z.boolean().default(false),
+  wakeBudgetPerHour: z.number().step(1).min(0).max(100_000).default(0),
 })
 
 /** One reclaim the autopilot performed, as reported. */
@@ -138,8 +214,20 @@ const PARK_SCHEMA = {
   },
 } as const
 
+/** One running-turn stall, as reported. */
+export const STALL_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    taskId: { type: 'string', required: true },
+    ownerName: { type: 'string', required: true },
+    forMs: { type: 'integer', required: true },
+    at: { type: 'integer', required: true },
+  },
+} as const
+
 /** One team's row in the status output. */
-const TEAM_SCHEMA = {
+export const TEAM_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -152,6 +240,7 @@ const TEAM_SCHEMA = {
     skippedNoMember: { type: 'integer', required: true },
     skippedDeclined: { type: 'integer', required: true },
     skippedParked: { type: 'integer', required: true },
+    skippedBudget: { type: 'integer', required: true },
     why: { type: 'array', items: { type: 'string' }, required: true },
     unclaimed: { type: 'integer', required: true },
     pending: { type: 'integer', required: true },
@@ -160,6 +249,10 @@ const TEAM_SCHEMA = {
     breakerBlocked: { type: 'integer', required: true },
     reclaimed: { type: 'integer', required: true },
     parked: { type: 'array', items: PARK_SCHEMA, required: true },
+    stalled: { type: 'integer', required: true },
+    stallWarnings: { type: 'integer', required: true },
+    stallInterrupts: { type: 'integer', required: true },
+    statusWriteFailed: { type: 'boolean', required: true },
     tasks: { type: 'integer', required: true },
     inFlight: { type: 'integer', required: true },
     claimable: { type: 'integer', required: true },
@@ -167,14 +260,17 @@ const TEAM_SCHEMA = {
     done: { type: 'integer', required: true },
     idle: { type: 'integer', required: true },
     slots: { type: 'integer', required: true },
+    wakesThisHour: { type: 'integer', required: true },
+    wakeBudget: { type: 'integer', required: true },
     lastTickAt: { type: 'integer' },
     lastReclaim: RECLAIM_SCHEMA,
     lastDispatch: DISPATCH_SCHEMA,
+    lastStall: STALL_SCHEMA,
   },
 } as const
 
 /** The calling team's live board. */
-const CALLER_SCHEMA = {
+export const CALLER_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -182,6 +278,7 @@ const CALLER_SCHEMA = {
     tasks: { type: 'integer', required: true },
     inFlight: { type: 'integer', required: true },
     claimable: { type: 'integer', required: true },
+    parked: { type: 'integer', required: true },
     blocked: { type: 'integer', required: true },
     done: { type: 'integer', required: true },
     idle: { type: 'integer', required: true },
@@ -190,12 +287,15 @@ const CALLER_SCHEMA = {
 } as const
 
 /** Report schema for the status tool. */
-const STATUS_SCHEMA = {
+export const STATUS_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
     enabled: { type: 'boolean', required: true },
     dryRun: { type: 'boolean', required: true },
+    version: { type: 'string', required: true },
+    health: { type: 'string', required: true },
+    uptimeMs: { type: 'integer', required: true },
     rounds: { type: 'integer', required: true },
     dispatched: { type: 'integer', required: true },
     suppressed: { type: 'integer', required: true },
@@ -203,6 +303,8 @@ const STATUS_SCHEMA = {
     unclaimed: { type: 'integer', required: true },
     reclaimed: { type: 'integer', required: true },
     parked: { type: 'integer', required: true },
+    stalled: { type: 'integer', required: true },
+    stallInterrupts: { type: 'integer', required: true },
     teams: { type: 'array', items: TEAM_SCHEMA, required: true },
     caller: CALLER_SCHEMA,
     lastError: { type: 'string' },
@@ -225,6 +327,7 @@ function readCallerBoard(
   ctx: Context,
   agent: unknown,
   config: Required<Config>,
+  state: AutopilotState,
 ): LiveBoard | undefined {
   if (agent === undefined || agent === null) return undefined
   const membership = ctx.agentTeams.tryMembership(agent as never)
@@ -236,20 +339,104 @@ function readCallerBoard(
   // The team's own budget override applies, so the live board reports the
   // same slot count the autopilot would actually use for this team.
   const budget = resolveBudget(team, config.teamBudgets, config.maxConcurrent)
-  const summary = boardSummary(
-    ctx.agentTeams.listTasks(lead),
+  const tasks = ctx.agentTeams.listTasks(lead)
+  // Fold in the two pieces of memory that change the answer: a parked task is
+  // not offerable, and a slot promised to an unanswered wake is not free. Both
+  // are numbers a Lead reads to decide "is there room for one more task", so
+  // the caller's own board has to agree with the decision the loop would make.
+  const summary = callerBoard(
+    tasks,
     ctx.agentTeams.listMembers(lead),
     budget,
+    state.teams.get(team),
   )
   return {
     team,
     tasks: summary.tasks,
     inFlight: summary.inFlight,
     claimable: summary.claimable,
+    parked: summary.parked,
     blocked: summary.blocked,
     done: summary.done,
     idle: summary.idle,
     slots: summary.slots,
+  }
+}
+
+/**
+ * Resolve raw configuration into the values the loop runs on.
+ *
+ * Two things are deliberate here and must stay in step with the `Config`
+ * schema above:
+ *
+ * - **bounds are re-applied.** The schema is what a well-formed loader hands
+ *   over, but config can also arrive from a hand-edited patch or a store that
+ *   never validated it, and a `tickTimeoutMs: 5` there would spin the loop. The
+ *   clamp is the last line of defence, so it is intentionally not a feature.
+ * - **defaults live in exactly one place.** Every `??` fallback must equal the
+ *   schema default: two copies of the same number can disagree, and when they
+ *   do, the silent one wins. `scripts/verify-status.mjs` asserts the pair
+ *   matches so this cannot drift unnoticed.
+ *
+ * @param config - raw plugin configuration.
+ * @returns every setting populated.
+ */
+/**
+ * Clamp one numeric setting into its declared bounds.
+ *
+ * Every key the schema bounds gets clamped here too. Bounds live in two places
+ * on purpose (the schema rejects bad operator input; this is the last line of
+ * defence for values that reach `apply` without validation), but the two must
+ * agree — `verify-status` asserts the defaults do. The keys that matter most are
+ * not the exotic ones: `maxConcurrent` and `halfOpenProbe` at `0` do not fail
+ * loudly, they zero the slots forever, and a team that never dispatches looks
+ * exactly like a team with nothing to do.
+ *
+ * @param value - raw value (already defaulted).
+ * @param min - inclusive lower bound.
+ * @param max - inclusive upper bound.
+ * @returns the clamped value.
+ */
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max)
+}
+
+/**
+ * Resolve plugin configuration: apply schema defaults, then clamp every
+ * bounded numeric into range.
+ * @param config - raw plugin configuration.
+ * @returns the fully resolved configuration.
+ */
+export function resolveConfig(config: Config = {}): Required<Config> {
+  return {
+    enabled: config.enabled ?? true,
+    tickTimeoutMs: clamp(config.tickTimeoutMs ?? 30_000, 10_000, 3_600_000),
+    maxConcurrent: clamp(config.maxConcurrent ?? 2, 1, 16),
+    // Not bounded above on purpose: a long cooldown or heartbeat is a slow but
+    // honest choice, and clamping it would silently override an operator's
+    // intent. Only the values that zero out real work (`0` slots, `0` probes)
+    // are forced into range.
+    wakeCooldownMs: Math.max(config.wakeCooldownMs ?? 60_000, 0),
+    dryRun: config.dryRun ?? false,
+    teamBudgets: Object.fromEntries(
+      Object.entries(config.teamBudgets ?? {}).map(([team, budget]) => [team, clamp(budget, 1, 16)]),
+    ),
+    errorThreshold: clamp(config.errorThreshold ?? 3, 1, 64),
+    openCooldownMs: clamp(config.openCooldownMs ?? 60_000, 1_000, 3_600_000),
+    halfOpenProbe: clamp(config.halfOpenProbe ?? 1, 1, 16),
+    reclaimAfterMs: clamp(config.reclaimAfterMs ?? 300_000, 1_000, 3_600_000),
+    reclaimOnFailed: config.reclaimOnFailed ?? true,
+    reclaimRetryLimit: clamp(config.reclaimRetryLimit ?? 3, 0, 32),
+    statusFile: config.statusFile ?? '',
+    statusHeartbeatMs: Math.max(config.statusHeartbeatMs ?? 600_000, 0),
+    livenessEnabled: config.livenessEnabled ?? true,
+    livenessGraceMs: clamp(config.livenessGraceMs ?? 60_000, 1_000, 3_600_000),
+    livenessSettleGraceMs: clamp(config.livenessSettleGraceMs ?? 3_000, 0, 600_000),
+    stalledRunningMs: clamp(config.stalledRunningMs ?? 900_000, 0, 3_600_000),
+    interruptStalled: config.interruptStalled ?? false,
+    // `0` keeps meaning "off", so the clamp floor must not turn an unset budget
+    // into a one-wake budget.
+    wakeBudgetPerHour: clamp(config.wakeBudgetPerHour ?? 0, 0, 100_000),
   }
 }
 
@@ -259,22 +446,7 @@ function readCallerBoard(
  * @param config - plugin configuration from the loader.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const resolved: Required<Config> = {
-    enabled: config.enabled ?? true,
-    tickTimeoutMs: Math.min(Math.max(config.tickTimeoutMs ?? 30_000, 10_000), 3_600_000),
-    maxConcurrent: config.maxConcurrent ?? 2,
-    wakeCooldownMs: config.wakeCooldownMs ?? 60_000,
-    dryRun: config.dryRun ?? false,
-    teamBudgets: config.teamBudgets ?? {},
-    errorThreshold: config.errorThreshold ?? 3,
-    openCooldownMs: config.openCooldownMs ?? 60_000,
-    halfOpenProbe: config.halfOpenProbe ?? 1,
-    reclaimAfterMs: Math.min(Math.max(config.reclaimAfterMs ?? 300_000, 1_000), 3_600_000),
-    reclaimOnFailed: config.reclaimOnFailed ?? true,
-    reclaimRetryLimit: Math.min(Math.max(config.reclaimRetryLimit ?? 3, 0), 32),
-    statusFile: config.statusFile ?? '',
-    statusHeartbeatMs: config.statusHeartbeatMs ?? 600_000,
-  }
+  const resolved = resolveConfig(config)
   const state: AutopilotState = createAutopilotState()
 
   /**
@@ -290,10 +462,19 @@ export function apply(ctx: Context, config: Config = {}): void {
     const unclaimed = teams.reduce((sum, team) => sum + team.unclaimed, 0)
     const reclaimed = teams.reduce((sum, team) => sum + team.reclaimed, 0)
     const parked = teams.reduce((sum, team) => sum + team.parked.length, 0)
-    const caller = readCallerBoard(ctx, agent, resolved)
+    const stalled = teams.reduce((sum, team) => sum + team.stalled, 0)
+    const stallInterrupts = teams.reduce((sum, team) => sum + team.stallInterrupts, 0)
+    const caller = readCallerBoard(ctx, agent, resolved, state)
     return {
       enabled: resolved.enabled,
       dryRun: resolved.dryRun,
+      version: version(),
+      health: healthOf(resolved.enabled, teams),
+      // Every counter below is in-memory, so a restart zeroes all of them and
+      // leaves the task board untouched. Reporting how long this process has
+      // been counting is what turns "dispatched=3" into something readable, and
+      // explains a wake budget that looks untouched right after it was spent.
+      uptimeMs: Math.max(0, Date.now() - state.startedAt),
       rounds: state.rounds,
       dispatched,
       suppressed,
@@ -301,6 +482,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       unclaimed,
       reclaimed,
       parked,
+      stalled,
+      stallInterrupts,
       teams,
       ...caller === undefined ? {} : { caller },
       ...state.lastError === undefined ? {} : { lastError: state.lastError },
@@ -309,7 +492,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'team_autopilot_status',
-    description: 'Report the team-autopilot dispatch loop state: lifetime totals, a per-team breakdown, the calling team\'s live board, and the last reclaim/dispatch with their outcome. Tasks parked after repeated reclaims are listed with the count that parked them.',
+    description: 'Report the team-autopilot dispatch loop state: lifetime totals, a per-team breakdown, the calling team\'s live board, and the last reclaim/dispatch/stall with their outcome. Tasks parked after repeated reclaims are listed with the count that parked them.',
     parameters: {},
     output: {
       schema: STATUS_SCHEMA,
@@ -323,13 +506,19 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
   }))
 
+  // Subscribed on the plugin's own context, so the listener goes away with the
+  // plugin. Created before the loop starts: a turn boundary that arrives while
+  // the first round is still reading the board is still one the loop can use.
+  const liveness = resolved.livenessEnabled ? createLiveness() : undefined
+  if (liveness !== undefined) trackLiveness(ctx, liveness)
+
   ctx.effect(() => {
     const controller = new AbortController()
     if (resolved.enabled) {
       // The loop fences every round and never exits on its own, so this catch
       // is a last-resort net for anything that escapes the fence. It must not
       // be able to take the dispatcher down silently.
-      void loop(ctx, resolved, state, controller.signal).catch((error: unknown) => {
+      void loop(ctx, resolved, state, controller.signal, liveness).catch((error: unknown) => {
         state.lastError = error instanceof Error ? error.message : String(error)
       })
     }

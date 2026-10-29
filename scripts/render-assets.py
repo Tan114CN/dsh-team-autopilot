@@ -176,7 +176,7 @@ def card() -> None:
     footer_right = 1520
     for index, (text, colour) in enumerate((
         ("dsh plugin --profile web add dsh-team-autopilot", MUTED),
-        ("github.com/Tan114CN/dsh-team-autopilot", FAINT),
+        ("github.com/wooden-tan/dsh-team-autopilot", FAINT),
     )):
         offset = footer_right - draw.textlength(text, font=mono_sm)
         draw.text((offset, 848 + index * 30), text, font=mono_sm, fill=colour)

@@ -19,6 +19,7 @@
  */
 
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
+import type { Liveness } from './liveness.ts'
 import { isInFlight } from './select.ts'
 
 /** One task that should be handed back to the pool. */
@@ -69,6 +70,24 @@ export interface ReclaimInput {
   readonly reclaimOnFailed: boolean
   /** Task id to the epoch ms it was first seen stalled. */
   readonly stalled: ReadonlyMap<string, number>
+  /**
+   * Observed turn boundaries, when available.
+   *
+   * Absent means the caller is not tracking them, in which case stall
+   * detection runs on `reclaimAfterMs` alone — the behaviour this module had
+   * before liveness existed.
+   */
+  readonly liveness?: Liveness | undefined
+  /**
+   * How long an owner may sit idle after its turn ended before the task is
+   * reclaimed.
+   *
+   * Measured from the observed turn end, not from the first `inactive` sight,
+   * so it can be far shorter than `reclaimAfterMs` and still be safe: the
+   * uncertainty that forces the long window — has a turn started at all? — is
+   * already resolved by the observation.
+   */
+  readonly livenessGraceMs?: number
 }
 
 /** What to release, plus the updated stall observation table. */
@@ -103,6 +122,21 @@ export interface ReclaimResult {
  * A `running` or `provisioning` owner is never evidence of a stall, and work
  * held by the Lead is never reclaimed: releasing it would discard work the
  * human-facing driver is doing.
+ *
+ * A fourth cause outranks all three when it is observable, and it is the only
+ * one that is not an inference:
+ *
+ * 0. **owner's turn ended** — the member was seen entering `running` and then
+ *    `idle` (see {@link Liveness}), and the task is still in flight. That is a
+ *    finished turn that did not finish the work, so `livenessGraceMs` — a
+ *    wait measured from the turn's actual end — is enough to declare it,
+ *    instead of the much longer `reclaimAfterMs` a mere `inactive` needs.
+ *
+ * The two durations are not alternatives to each other. When both are
+ * satisfiable the shorter one wins, and when no turn boundary has been
+ * observed the decision falls back to `reclaimAfterMs` exactly as before — an
+ * absent observation can only ever make this module *less* certain, never
+ * more aggressive.
  *
  * @param input - board, roster, clock, limits, and the stall table.
  * @returns what to release and the updated stall table.
@@ -155,6 +189,28 @@ export function planReclaim(input: ReclaimInput): ReclaimResult {
       // `running` is mid-turn, `provisioning` has not started yet.
       stalled.delete(task.id)
       continue
+    }
+
+    // A finished turn is the strong evidence, so it is checked first and it
+    // also re-bases the weaker clock: the moment a turn ended is a truer start
+    // for "how long has this owner been quiet" than the moment the board
+    // happened to be read and found the member inactive.
+    const turnEnd = input.liveness?.lastTurnEndAt(owner.name)
+    if (turnEnd !== undefined) {
+      const previous = stalled.get(task.id)
+      if (previous === undefined || previous < turnEnd) stalled.set(task.id, turnEnd)
+      const quiet = input.now - turnEnd
+      if (quiet >= (input.livenessGraceMs ?? input.reclaimAfterMs)) {
+        stalled.delete(task.id)
+        releases.push({
+          taskId: task.id,
+          revision: task.revision,
+          reason: `owner "${owner.name}" turn ended ${quiet}ms ago without finishing`,
+          previousOwner: owner.name,
+          sinceAt: turnEnd,
+        })
+        continue
+      }
     }
 
     const since = stalled.get(task.id)

@@ -15,11 +15,16 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join, normalize, resolve } from 'node:path'
+import semver from 'semver'
 
 const root = resolve(import.meta.dirname, '..')
 const results = []
 const check = (label, ok, detail = '') => results.push({ label, ok: Boolean(ok), detail })
 
+/** `semver.satisfies` with the prerelease rules node-semver actually applies. */
+function semverSatisfies(version, range) {
+  return semver.satisfies(version, range, { includePrerelease: false })
+}
 /** Run `npm pack --dry-run --json` in a way that works with or without `npm` on PATH. */
 function packJson() {
   const args = ['pack', '--dry-run', '--json', '--ignore-scripts']
@@ -122,6 +127,50 @@ for (const match of readme.matchAll(/\]\(([^)]+)\)/g)) {
   if (!shipped.has(target)) dangling.push(raw)
 }
 check('README relative links resolve in tarball', dangling.length === 0, dangling.join(', '))
+
+// 7. Peer ranges must keep accepting the harness' prerelease line.
+//
+// A range like `>=0.2.1-rc.2 <0.3.0` looks like it covers every 0.2.x
+// prerelease, but node-semver only lets a prerelease satisfy a comparator
+// whose own `major.minor.patch` tuple carries a prerelease tag. `0.2.2-alpha.2`
+// therefore falls outside it, silently — no warning, just a resolver that
+// picks something else. The upstream contributing guide calls this out by
+// name, and the fix is an explicit `||` branch that puts a prerelease tag on
+// the matching tuple.
+//
+// The guard checks the ranges against the versions the harness actually
+// publishes, so the check moves when upstream moves instead of rotting.
+const PEER_WATCH = [
+  { pkg: '@deepseek-ai/dsh-agent', peer: '@deepseek-ai/dsh-agent', versions: ['0.2.1-rc.2', '0.2.2-alpha.2'] },
+  { pkg: '@deepseek-ai/dsh-tools', peer: '@deepseek-ai/dsh-tools', versions: ['0.2.1-rc.2', '0.2.2-alpha.2'] },
+  { pkg: '@deepseek-ai/dsh-experimental-agent-team', peer: '@deepseek-ai/dsh-experimental-agent-team', versions: ['0.2.1-rc.2', '0.2.2-alpha.2'] },
+  { pkg: '@deepseek-ai/cordis', peer: '@deepseek-ai/cordis', versions: ['4.0.5', '4.0.5-alpha.2', '4.0.6-alpha.1'] },
+  { pkg: '@deepseek-ai/schemastery', peer: '@deepseek-ai/schemastery', versions: ['3.18.5', '3.18.5-alpha.2', '3.18.6-alpha.1'] },
+]
+for (const { peer, versions } of PEER_WATCH) {
+  const range = pkg.peerDependencies?.[peer]
+  if (typeof range !== 'string') {
+    check(`peer range covers prereleases: ${peer}`, false, 'no peer range declared')
+    continue
+  }
+  const missed = versions.filter(version => !semverSatisfies(version, range))
+  check(`peer range covers prereleases: ${peer}`, missed.length === 0, missed.length === 0 ? range : `${missed.join(', ')} not covered by "${range}"`)
+}
+
+// `engines.dsh` is what the host's plugin manager checks before installing;
+// it has to accept the same prerelease line or the plugin is refused outright.
+const dshEngine = pkg.engines?.dsh
+if (typeof dshEngine === 'string') {
+  const missed = ['0.2.1-rc.2', '0.2.2-alpha.2'].filter(version => !semverSatisfies(version, dshEngine))
+  check('engines.dsh covers prereleases', missed.length === 0, missed.length === 0 ? dshEngine : `${missed.join(', ')} not covered by "${dshEngine}"`)
+} else {
+  check('engines.dsh covers prereleases', false, 'no engines.dsh declared')
+}
+
+// The published `repository` must point back at the repository the entry
+// lists, or the npm↔repo mapping is never picked up.
+const repoUrl = pkg.repository?.url ?? ''
+check('repository points at the live repo', repoUrl.includes('github.com/wooden-tan/dsh-team-autopilot'), repoUrl)
 
 // Report.
 const pad = label => String(label).padEnd(Math.max(...results.map(r => r.label.length)) + 2)

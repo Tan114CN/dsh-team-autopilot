@@ -41,9 +41,9 @@ dsh 生态的插件发现**不是靠人传人，是靠一份目录数据**：
 
 这两项是**所有自动收录的前提**：`dsh-plugin` topic 是 awesome 列表的硬性收录条件，也是目录站每日爬取的信号。
 
-已完成：`description` 与 8 个 topic 都已写入（`curl api.github.com/repos/Tan114CN/dsh-team-autopilot` 可复核）。以下值留作存档，将来改描述时以这里为准：
+已完成：`description` 与 8 个 topic 都已写入（`curl api.github.com/repos/wooden-tan/dsh-team-autopilot` 可复核）。以下值留作存档，将来改描述时以这里为准：
 
-打开 <https://github.com/Tan114CN/dsh-team-autopilot> → 右侧 About 旁的齿轮：
+打开 <https://github.com/wooden-tan/dsh-team-autopilot> → 右侧 About 旁的齿轮：
 
 **Description**（复制这一整行）：
 
@@ -68,13 +68,13 @@ autopilot
 
 一个文件就是全部投稿。文件名必须是 `data/plugins/<owner>__<repo>.yml`：
 
-**`data/plugins/Tan114CN__dsh-team-autopilot.yml`**
+**`data/plugins/wooden-tan__dsh-team-autopilot.yml`**
 
 ```yaml
-url: https://github.com/Tan114CN/dsh-team-autopilot
-name: Tan114CN/dsh-team-autopilot
+url: https://github.com/wooden-tan/dsh-team-autopilot
+name: wooden-tan/dsh-team-autopilot
 category: workflow
-icon: https://raw.githubusercontent.com/Tan114CN/dsh-team-autopilot/main/assets/icon-180.png
+icon: https://raw.githubusercontent.com/wooden-tan/dsh-team-autopilot/main/assets/icon-180.png
 description:
   en: 'Deterministic auto-dispatch on the native Agent Teams seam, with no team layer of its own: a background tick wakes an idle member for each ready unowned task, reclaims tasks whose owner went quiet, and treats overlapping write scopes as a soft lock at dispatch.'
   zh: 在原生 Agent Teams 接缝上做确定性自动派发，不另造团队层：后台 tick 为每个就绪且无主的任务唤醒空闲成员，收回持有者已停摆的任务，并把写域重叠在派发时刻当作软锁处理。
@@ -84,7 +84,7 @@ description:
 
 新建文件并开 PR（链接已预填文件名）：
 
-<https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/new/main/data/plugins?filename=Tan114CN__dsh-team-autopilot.yml>
+<https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/new/main/data/plugins?filename=wooden-tan__dsh-team-autopilot.yml>
 
 **仓库年龄门槛**：CI 要求仓库创建满 1 天。我们是 `2026-10-27T18:17:09Z` 创建的，也就是**北京时间 2026-10-29 02:17 之后**才满足。早于此提交会被 CI 挡下（不是拒绝，改完重提即可，但没必要白跑一次）。
 
@@ -94,8 +94,8 @@ description:
 | --- | --- |
 | `package.json` 声明 `dsh.bundle` | ✅ `{"bundle":{"patch":"./cordis.patch.yml"}}` |
 | `cordis.patch.yml` 存在于仓库根 | ✅ |
-| 发布的包 `repository` 指回本仓库 | ✅ `git+https://github.com/Tan114CN/dsh-team-autopilot.git` |
-| 真实可用代码、非占位 | ✅ 50 项 verify + 29 项 integration + 28 项验收全绿 |
+| 发布的包 `repository` 指回本仓库 | ✅ `git+https://github.com/wooden-tan/dsh-team-autopilot.git` |
+| 真实可用代码、非占位 | ✅ 72 项 verify + 45 项 integration + 28 项验收全绿 |
 | 仓库年龄 ≥ 1 天 | ⏳ **唯一未满足项**：`created_at=2026-10-27T18:17:09Z`，北京时间 10-29 02:17 起达标 |
 | 已加 `dsh-plugin` topic | ✅ 8 个已设（2026-10-28 复核） |
 

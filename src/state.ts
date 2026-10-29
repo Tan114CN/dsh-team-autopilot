@@ -16,6 +16,26 @@
  */
 
 import type { BreakerState } from './breaker.ts'
+import type { StallRecord } from './stall.ts'
+
+/**
+ * One running-turn stall the autopilot observed.
+ *
+ * `planReclaim` releases an owner that is *not* working on its task any more;
+ * this reports the opposite and worse state — an owner that looks busy and can
+ * never finish. Kept as a record rather than a counter because the useful fact
+ * is which task and how long, not just how many.
+ */
+export interface StallRecordView {
+  /** Id of the task the stuck owner is holding. */
+  taskId: string
+  /** Member that appears to be stuck. */
+  ownerName: string
+  /** How long the owner had been busy when the stall was seen, in ms. */
+  forMs: number
+  /** Epoch milliseconds of the observation. */
+  at: number
+}
 
 /**
  * One reclaim the autopilot performed.
@@ -51,6 +71,17 @@ export interface PendingWake {
   memberName: string
   /** Epoch milliseconds the wake was sent. */
   at: number
+  /**
+   * True when nothing was actually sent (`dryRun`), so the wake is a forecast.
+   *
+   * It must still reserve its slot for the cooldown — otherwise a dry run would
+   * re-plan the same wakes every round and predict a busier stream than the
+   * real mode ever produces. But it must never be *judged*: nobody was asked,
+   * so settling it as "unclaimed" would invent a refusal and push that member
+   * into the declined set, which then blocks the very dispatch the dry run is
+   * supposed to be demonstrating.
+   */
+  simulated?: boolean
 }
 
 /**
@@ -107,12 +138,12 @@ export interface ParkRecord {
 /**
  * Why a ready task went untaken in one round.
  *
- * Four causes, four different fixes: widen the write scopes, add a member, ask
- * the member why it is not taking work, or look at a task that keeps coming
- * back. A closed union on purpose — a typo must not be able to invent a fifth
- * cause that nobody knows how to act on.
+ * Five causes, five different fixes: widen the write scopes, add a member, ask
+ * the member why it is not taking work, look at a task that keeps coming back,
+ * or raise the hourly wake budget. A closed union on purpose — a typo must not
+ * be able to invent a sixth cause that nobody knows how to act on.
  */
-export type SkipKind = 'scope' | 'noMember' | 'declined' | 'parked'
+export type SkipKind = 'scope' | 'noMember' | 'declined' | 'parked' | 'budget'
 
 /** One team's observable counters and the board as of its last tick. */
 export interface TeamState {
@@ -134,6 +165,15 @@ export interface TeamState {
   skippedDeclined: number
   /** Skips caused by the task being parked after repeated reclaims. */
   skippedParked: number
+  /**
+   * Skips caused by the hourly wake budget being spent.
+   *
+   * Separate from the other four because it is the only cause that is working
+   * as configured rather than going wrong: a non-zero value says "this team
+   * wanted to start more work than you allowed it to pay for this hour", which
+   * is an answer, not a fault.
+   */
+  skippedBudget: number
   /**
    * Why the **last** round skipped ready tasks, deduplicated and sorted.
    *
@@ -264,6 +304,67 @@ export interface TeamState {
    * round.
    */
   unparksThisRound: string[]
+  /**
+   * Running-turn stall observations, keyed by task id, carried across rounds.
+   *
+   * Same shape and same lifecycle as the reclaim table: an entry appears the
+   * first time a task is seen held by a busy owner and disappears as soon as
+   * that stops being true. Rebuilt from the board every round, so it is bounded
+   * by the tasks actually in this state.
+   */
+  stallSeen: Map<string, StallRecord>
+  /** In-flight tasks with a busy owner past the stall limit at the last tick. */
+  stalled: number
+  /**
+   * Stall warnings reported, one per task per round it stayed stalled.
+   *
+   * Cumulative, and the number worth watching: while the same task is stalled
+   * it climbs once per tick, so a large value next to a small `stallWarnings`
+   * on other teams means one team is quietly wedged, not that the board is
+   * hopping.
+   */
+  stallWarnings: number
+  /** Stalled turns the autopilot interrupted (only with `interruptStalled`). */
+  stallInterrupts: number
+  /** This team's most recent stall, if any. */
+  lastStall?: StallRecordView
+  /**
+   * Tasks stalled this round, as `taskId<ownerName`, in order.
+   *
+   * The event line needs the round's own answer, the same way
+   * {@link reclaimsThisRound} does: a single `lastStall` remembers only one of
+   * possibly several wedged turns. Cleared at the start of each round.
+   */
+  stallsThisRound: string[]
+  /**
+   * Whether the last attempt to append to `statusFile` failed.
+   *
+   * A `false` here is only ever set when a write was attempted. It exists
+   * because the status file is the single channel a headless user reads, and
+   * every way it can break (relative path, directory that does not exist, a
+   * permission the sandbox took away) fails identically on every round and used
+   * to leave no trace at all. The flag clears on the first write that lands, so
+   * it reports a live problem rather than a remembered one.
+   */
+  statusWriteFailed: boolean
+  /**
+   * When this team's most recent wakes were started, oldest first.
+   *
+   * The wake budget is measured against this list rather than a counter, so a
+   * burst just before the window edge still counts against the next burst. It
+   * is pruned every round and can never outgrow the configured budget, since
+   * no stamp is added once the allowance is spent.
+   */
+  wakeStamps: number[]
+  /** Wakes inside the current window, as of the last tick (report gauge). */
+  wakesThisHour: number
+  /**
+   * The budget in force at the last tick, for rendering.
+   *
+   * Kept on the bucket so the status line can print `wakes=used/limit` without
+   * reaching for the config; `0` renders as `off`.
+   */
+  wakeBudget: number
 }
 
 /** Autopilot-wide observable state. */
@@ -271,11 +372,26 @@ export interface AutopilotState {
   /**
    * One bucket per team, keyed by `TeamId`.
    *
-   * Buckets are never removed, so lifetime per-team counters survive the team
-   * that produced them and the totals can be derived from these buckets
-   * without a second source of truth drifting out of sync.
+   * Buckets outlive the team that produced them so the lifetime counters and
+   * the totals stay derivable from one source of truth, but the map is capped
+   * (see {@link MAX_TEAM_BUCKETS}): a long-lived host that keeps meeting new
+   * teams would otherwise grow this map forever. Eviction always picks the
+   * least recently ticked bucket, so a live team is never a victim.
    */
   teams: Map<string, TeamState>
+  /**
+   * When this process started counting.
+   *
+   * Every counter in this file is in-memory, so all of them restart at zero
+   * when the host restarts: dispatch totals, reclaim counts, declined members,
+   * the breaker, the hourly wake budget. That is deliberate (the plugin owns no
+   * durable state, see the README), but it makes a bare `dispatched=3`
+   * unreadable — three in the last five minutes and three in the last three
+   * days call for opposite reactions. The age of this number is the missing
+   * denominator, and it is the one fact that explains why a budget can look
+   * untouched moments after it was spent.
+   */
+  startedAt: number
   /** Dispatch rounds across every team. */
   rounds: number
   /** Most recent error seen by the loop, if any. */
@@ -289,9 +405,46 @@ export interface AutopilotState {
 export function createAutopilotState(): AutopilotState {
   return {
     teams: new Map(),
+    startedAt: Date.now(),
     rounds: 0,
     lastError: undefined,
   }
+}
+
+/**
+ * Upper bound on remembered team buckets.
+ *
+ * A bucket is created the first time a team is seen and is deliberately kept
+ * while the team lives: it carries the counters a human reads to decide what
+ * to do next, and dropping it after a quiet spell would erase exactly the
+ * history that explains why the team went quiet.
+ *
+ * What it must not do is grow without bound. A long-lived host that creates and
+ * tears down teams (one per session, or a test harness that mints fresh TeamIds)
+ * would otherwise leak a bucket per team forever, and the status report grows
+ * with it. The real working set is one or two teams, so the cap is generous and
+ * eviction only ever takes the least recently ticked bucket — a live team ticks
+ * every round, so it can never be the victim.
+ */
+const MAX_TEAM_BUCKETS = 32
+
+/**
+ * Drop the bucket that has gone the longest without a tick.
+ * @param state - autopilot state to mutate.
+ */
+function evictLeastRecentlyTicked(state: AutopilotState): void {
+  let victim: string | undefined
+  let oldest = Number.POSITIVE_INFINITY
+  // Insertion order breaks ties, so an equal-age map still evicts deterministically
+  // (the team seen first goes first).
+  for (const [key, bucket] of state.teams) {
+    const seen = bucket.lastTickAt ?? 0
+    if (seen < oldest) {
+      oldest = seen
+      victim = key
+    }
+  }
+  if (victim !== undefined) state.teams.delete(victim)
 }
 
 /**
@@ -303,6 +456,7 @@ export function createAutopilotState(): AutopilotState {
 export function teamState(state: AutopilotState, team: string): TeamState {
   const existing = state.teams.get(team)
   if (existing !== undefined) return existing
+  if (state.teams.size >= MAX_TEAM_BUCKETS) evictLeastRecentlyTicked(state)
   const created: TeamState = {
     team,
     ticks: 0,
@@ -313,6 +467,7 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     skippedNoMember: 0,
     skippedDeclined: 0,
     skippedParked: 0,
+    skippedBudget: 0,
     skipKinds: [],
     declined: new Map(),
     unclaimed: 0,
@@ -336,6 +491,15 @@ export function teamState(state: AutopilotState, team: string): TeamState {
     reclaimsThisRound: [],
     parksThisRound: [],
     unparksThisRound: [],
+    stallSeen: new Map(),
+    stalled: 0,
+    stallWarnings: 0,
+    stallInterrupts: 0,
+    stallsThisRound: [],
+    statusWriteFailed: false,
+    wakeStamps: [],
+    wakesThisHour: 0,
+    wakeBudget: 0,
   }
   state.teams.set(team, created)
   return created

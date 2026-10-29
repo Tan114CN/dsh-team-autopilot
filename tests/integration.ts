@@ -24,7 +24,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { TeamMemberView, TeamTaskView } from '@deepseek-ai/dsh-experimental-agent-team'
 import { createBreaker } from '../src/breaker.ts'
+import type { Breaker } from '../src/breaker.ts'
 import { tick, loop } from '../src/dispatch.ts'
+import { createLiveness } from '../src/liveness.ts'
+import { WAKE_WINDOW_MS } from '../src/budget.ts'
 import { createAutopilotState, teamState } from '../src/state.ts'
 import type { AutopilotState } from '../src/state.ts'
 import type { Config } from '../src/index.ts'
@@ -67,13 +70,27 @@ interface Host {
   updates: Array<{ taskId: string; action: string }>
   /** Make every `updateTask` throw, to stand in for a stale revision. */
   failUpdate: boolean
+  /** Names whose turn was cancelled, in order. */
+  interrupted: string[]
+  /** Make every `interrupt` throw, to stand in for a member that just went idle. */
+  failInterrupt: boolean
 }
 
 function makeHost(
   tasks: TeamTaskView[],
   members: TeamMemberView[],
 ): Host {
-  return { tasks, members, sent: [], attempts: 0, failSend: false, updates: [], failUpdate: false }
+  return {
+    tasks,
+    members,
+    sent: [],
+    attempts: 0,
+    failSend: false,
+    updates: [],
+    failUpdate: false,
+    interrupted: [],
+    failInterrupt: false,
+  }
 }
 
 function makeCtx(host: Host): Context {
@@ -107,6 +124,13 @@ function makeCtx(host: Host): Context {
           ownerName: null,
           revision: target.revision + 1,
         })
+      },
+      // Synchronous, exactly like `TeamService.interrupt`: the stall watch must
+      // handle a throwing interrupt without losing the round.
+      interrupt: (_caller: object, targetName: string): { previousStatus: 'running' | 'inactive' } => {
+        if (host.failInterrupt) throw new Error('simulated interrupt failure')
+        host.interrupted.push(targetName)
+        return { previousStatus: 'running' }
       },
     },
   }
@@ -142,6 +166,15 @@ const baseConfig: Required<Config> = {
   reclaimRetryLimit: 3,
   statusFile: '',
   statusHeartbeatMs: 600_000,
+  livenessEnabled: true,
+  livenessGraceMs: 60_000,
+  livenessSettleGraceMs: 3_000,
+  // Off by default, so every test below keeps its existing meaning: a long turn
+  // is only ever *reported* unless a test opts into the watch explicitly.
+  stalledRunningMs: 0,
+  interruptStalled: false,
+  // Off by default, so a test that wants the spend cap has to ask for it.
+  wakeBudgetPerHour: 0,
 }
 
 let passed = 0
@@ -236,6 +269,66 @@ await test('logs the breaker opening, then goes quiet while it stays open', asyn
   // bumped `held` did not add a line. The send failure is surfaced via `err=`
   // so the trip is not a mystery.
   assert.match(lines[0] ?? '', /breaker=open trips=1 held=0 err=/)
+})
+
+await test('dispatches again once the open breaker has cooled down', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+  )
+  const state = freshState()
+  const ctx = makeCtx(host)
+  // `halfOpenProbe: 0` is the value the schema forbids and the config clamp
+  // repairs. Hand it straight to `tick` to prove the breaker cannot be left
+  // latched even when it does arrive: without the close-on-empty rule the team
+  // would sit at `halfOpen` forever — no dispatch, hence no success, hence no
+  // way out — which reads exactly like a team with nothing to do.
+  const config: Required<Config> = { ...baseConfig, openCooldownMs: 1_000, halfOpenProbe: 0 }
+  const opened: Breaker = {
+    state: 'open',
+    consecutiveErrors: 3,
+    openedAt: Date.now() - 5_000,
+    halfOpenRemaining: 0,
+  }
+
+  const breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), opened, signal)
+  assert.deepEqual(
+    host.sent,
+    ['alice'],
+    `a cooled-down breaker must dispatch again (sent=${JSON.stringify(host.sent)} state=${breaker.state} dispatched=${teamOf(state).dispatched} blocked=${teamOf(state).breakerBlocked})`,
+  )
+  assert.equal(breaker.state, 'closed', 'the trip must not become permanent')
+  assert.equal(teamOf(state).breakerBlocked, 0, 'the round was never actually blocked')
+})
+
+await test('an open breaker still reclaims the slots it will need back', async () => {
+  // The breaker exists to stop *sending*. Reclaiming a stale owner sends
+  // nothing — it calls `updateTask`, whose failures are handled per call and
+  // never trip the breaker. Skipping it makes the outage cost twice: the
+  // cooldown passes, the breaker closes, and the stale owner still holds the
+  // only slot, so nothing can be dispatched for another full `reclaimAfterMs`.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, maxConcurrent: 1 }
+  const ctx = makeCtx(host)
+  const stalled = new Map<string, number>([['t1', Date.now() - 600_000]])
+  const opened: Breaker = {
+    state: 'open',
+    consecutiveErrors: 3,
+    openedAt: Date.now(),
+    halfOpenRemaining: 0,
+  }
+
+  const breaker = await tick(ctx, lead, config, state, 'team-1', new Map(), stalled, opened, signal)
+
+  assert.equal(breaker.state, 'open', 'the breaker must stay open for the whole cooldown')
+  assert.deepEqual(host.sent, [], 'an open breaker must not send a wake')
+  assert.equal(host.updates.length, 1, 'but it must still free the slot it will need back')
+  assert.equal(teamOf(state).breakerBlocked, 1, 'the round still counts as blocked')
+  assert.equal(teamOf(state).slots, 1, 'the freed slot is visible while the breaker is open')
 })
 
 await test('honours the per-team budget keyed by TeamId', async () => {
@@ -539,6 +632,52 @@ await test('does not judge a wake before the member had time to answer', async (
   assert.deepEqual(host.sent, ['alice', 'bob'], 'the refusal hands the task to the next member')
 })
 
+await test('a dry run holds the slot but never invents a refusal', async () => {
+  // `dryRun` is the recommended first-run mode: it is supposed to show what the
+  // policy *would* do. But nothing is sent, so nobody can answer — and judging
+  // such a wake as "unclaimed" would fabricate a refusal, put the member in the
+  // declined set, and make the dry run demonstrate its own bookkeeping artifact
+  // instead of the policy.
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive')],
+  )
+  const state = freshState()
+  const ctx = makeCtx(host)
+  // One slot, so the wake's reservation is the only thing left to observe.
+  const config: Required<Config> = {
+    ...baseConfig,
+    dryRun: true,
+    maxConcurrent: 1,
+    wakeCooldownMs: 30_000,
+  }
+  const lastWake = new Map<string, number>()
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  const team = teamOf(state)
+  assert.deepEqual(host.sent, [], 'a dry run sends nothing')
+  assert.equal(team.dispatched, 1, 'but the decision is still recorded')
+  assert.equal(team.pendingWakes.size, 1, 'and the wake it stands for is still owed')
+  const pending = team.pendingWakes.get('t1')
+  assert.ok(pending !== undefined)
+  assert.equal(pending.simulated, true, 'the wake is marked as never sent')
+
+  // Still inside the cooldown: the simulated wake keeps its slot, so the next
+  // round does not offer the same task a second time.
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).slots, 0, 'the unclaimed wake holds the only slot')
+  assert.deepEqual(host.sent, [])
+  assert.equal(teamOf(state).dispatched, 1, 'so the task is not offered again')
+
+  // Past the cooldown it is retired — but without judging anyone, because
+  // nobody was ever asked.
+  pending.at = Date.now() - 31_000
+  lastWake.set('t1', Date.now() - 31_000)
+  await tick(ctx, lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).unclaimed, 0, 'nobody was asked, so nobody refused')
+  assert.equal(teamOf(state).declined.size, 0, 'and no member is held to an invented refusal')
+  assert.equal(teamOf(state).lastDispatch?.claimed, undefined, 'no outcome was invented either')
+})
+
 await test('judges every wake a round sent, not just the last one', async () => {
   const host = makeHost(
     [
@@ -613,6 +752,58 @@ await test('a reclaim settles a still-pending wake as answered, not unclaimed', 
   // Alice was the only member, and the reclaim avoids handing the task straight
   // back to her, so no new wake is recorded — the settled `claimed=true` stands.
   assert.equal(teamOf(state).lastDispatch?.claimed, true, 'the reclaim settles the wake as claimed')
+})
+
+await test('a reclaim frees the task from the wake cooldown it was sent under', async () => {
+  // A wake stamp says "do not offer this task again inside one cooldown". It
+  // guards one attempt, not the task forever: Alice was woken, took the task,
+  // went quiet and was reclaimed. If the stamp survives the reclaim, the retry
+  // the reclaim exists to enable waits out the whole window instead — the same
+  // shape of bug as a refusal that keeps its cooldown.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 60_000 }
+  const team = teamState(state, 'team-1')
+  const now = Date.now()
+  // Alice's wake is only 2s old — well inside the 60s cooldown — and the owner
+  // has been stalled long enough to be reclaimed.
+  const lastWake = new Map<string, number>([['t1', now - 2_000]])
+  team.lastDispatch = { taskId: 't1', memberName: 'alice', at: now - 2_000, repeats: 1, sent: true }
+  const stalled = new Map<string, number>([['t1', now - 600_000]])
+  await tick(makeCtx(host), lead, config, state, 'team-1', lastWake, stalled, createBreaker(), signal)
+
+  assert.equal(teamOf(state).reclaimed, 1, 'the stalled owner is released')
+  assert.deepEqual(host.sent, ['bob'], 'the reclaimed task goes to the free member at once')
+  assert.equal(teamOf(state).suppressed, 0, 'the old wake must not suppress the retry')
+})
+
+await test('stops remembering a wake it can no longer hold back', async () => {
+  // The stamp map is only ever read for tasks that are about to be sent, so an
+  // entry that expired or whose task left the board would otherwise last for
+  // the life of the process: one number and one task id per task this
+  // autopilot had ever dispatched.
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'running')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 60_000 }
+  const now = Date.now()
+  const lastWake = new Map<string, number>([
+    ['t1', now - 61_000], // expired: the cooldown it guarded is over
+    ['t9', now - 1_000], // gone: that task is not on the board any more
+  ])
+  await tick(makeCtx(host), lead, config, state, 'team-1', lastWake, new Map(), createBreaker(), signal)
+  assert.equal(lastWake.size, 0, 'neither stamp can suppress anything again')
+
+  // A live task still inside its window keeps its stamp: that one really does
+  // mean "do not offer this again yet".
+  const fresh = new Map<string, number>([['t1', now]])
+  await tick(makeCtx(host), lead, config, state, 'team-1', fresh, new Map(), createBreaker(), signal)
+  assert.equal(fresh.get('t1'), now, 'a stamp still inside its window survives')
 })
 
 await test('splits skipped tasks into scope conflicts and missing members', async () => {
@@ -830,6 +1021,160 @@ await test('serves only the team whose change-wait fired', async () => {
   assert.equal(state.teams.get('team-0'), undefined)
 })
 
+await test('does not wake past a wake that is still unclaimed', async () => {
+  // A wake is a promise: the member was told to claim and may not have claimed
+  // yet. Counting only in-flight work as "busy" re-woke the same pool on every
+  // tick, so two members got four instructions for three tasks.
+  const host = makeHost(
+    [task({ id: 't1' }), task({ id: 't2' }), task({ id: 't3' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, wakeCooldownMs: 60_000 }
+  const ctx = makeCtx(host)
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(host.sent.length, 2)
+  assert.equal(teamOf(state).pendingWakes.size, 2)
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(host.sent.length, 2, 'a second round re-woke a member that had not claimed yet')
+  assert.equal(teamOf(state).slots, 0)
+})
+
+await test('a spent wake budget stops dispatch and says so, then refills', async () => {
+  // The cap that matters is on *starts*, not on concurrency: two free slots and
+  // two idle members are worth nothing if the hour's allowance is already gone.
+  const host = makeHost(
+    [task({ id: 't1' }), task({ id: 't2' })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, maxConcurrent: 2, wakeBudgetPerHour: 1 }
+  const ctx = makeCtx(host)
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  const team = teamOf(state)
+  assert.equal(host.sent.length, 1, 'the budget allows one wake this hour')
+  assert.equal(team.wakesThisHour, 1)
+  assert.equal(team.wakeBudget, 1)
+
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(host.sent.length, 1, 'the second round spent more than the budget')
+  assert.ok(team.skippedBudget >= 1, 'the stop has to be reported as a budget stop')
+  assert.ok(team.skipKinds.includes('budget'), 'why=budget is the whole diagnosis')
+
+  // The window is a rolling hour measured from the stamps, so ageing them out
+  // is the same as an hour passing.
+  team.wakeStamps = [Date.now() - WAKE_WINDOW_MS - 1]
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(host.sent.length, 2, 'a rolled window must hand the budget back')
+  assert.equal(team.wakesThisHour, 1)
+})
+
+await test('reports a task whose owner has been running too long', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'running')],
+  )
+  const state = freshState()
+  const config: Required<Config> = { ...baseConfig, stalledRunningMs: 1_000 }
+  // `tick` reads the wall clock, so elapsed time is simulated by pre-seeding the
+  // observation table rather than by sleeping.
+  teamState(state, 'team-1').stallSeen.set('t1', { since: Date.now() - 5_000 })
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  const team = teamOf(state)
+  assert.equal(team.stalled, 1)
+  assert.equal(team.stallWarnings, 1)
+  assert.equal(team.lastStall?.taskId, 't1')
+  assert.equal(team.lastStall?.ownerName, 'alice')
+  assert.deepEqual(team.stallsThisRound, ['t1<alice'])
+  // Reporting only: interrupting live work is opt-in.
+  assert.deepEqual(host.interrupted, [])
+  assert.equal(team.stallInterrupts, 0)
+})
+
+await test('interrupts a stalled turn once, and only when asked', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'running')],
+  )
+  const state = freshState()
+  const config: Required<Config> = {
+    ...baseConfig,
+    stalledRunningMs: 1_000,
+    interruptStalled: true,
+  }
+  const ctx = makeCtx(host)
+  teamState(state, 'team-1').stallSeen.set('t1', { since: Date.now() - 5_000 })
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.deepEqual(host.interrupted, ['alice'])
+  assert.equal(teamOf(state).stallInterrupts, 1)
+  // The stall persists in the stub, but the same turn must not be cancelled
+  // twice: the member is still writing the terminal status the first interrupt
+  // caused.
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.deepEqual(host.interrupted, ['alice'])
+  assert.equal(teamOf(state).stallWarnings, 2)
+})
+
+await test('never interrupts under dryRun', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'running')],
+  )
+  const state = freshState()
+  const config: Required<Config> = {
+    ...baseConfig,
+    stalledRunningMs: 1_000,
+    interruptStalled: true,
+    dryRun: true,
+  }
+  teamState(state, 'team-1').stallSeen.set('t1', { since: Date.now() - 5_000 })
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  // dryRun promises the autopilot writes nothing to the team, and cancelling a
+  // live turn is the most destructive write there is.
+  assert.deepEqual(host.interrupted, [])
+  assert.equal(teamOf(state).stalled, 1)
+  assert.equal(teamOf(state).stallWarnings, 1)
+})
+
+await test('does not interrupt a provisioning member, which has no turn to cancel', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'provisioning')],
+  )
+  const state = freshState()
+  const config: Required<Config> = {
+    ...baseConfig,
+    stalledRunningMs: 1_000,
+    interruptStalled: true,
+  }
+  teamState(state, 'team-1').stallSeen.set('t1', { since: Date.now() - 5_000 })
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.deepEqual(host.interrupted, [])
+  // Still reported: it holds a slot while looking alive.
+  assert.equal(teamOf(state).stallWarnings, 1)
+})
+
+await test('keeps the round alive when the interrupt throws', async () => {
+  const host = makeHost(
+    [task({ id: 't1', status: 'in_progress', ownerName: 'alice' })],
+    [member('lead', 'running', 'lead'), member('alice', 'running')],
+  )
+  host.failInterrupt = true
+  const state = freshState()
+  const config: Required<Config> = {
+    ...baseConfig,
+    stalledRunningMs: 1_000,
+    interruptStalled: true,
+  }
+  teamState(state, 'team-1').stallSeen.set('t1', { since: Date.now() - 5_000 })
+  await tick(makeCtx(host), lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  // A member that went idle between the board read and the interrupt is not a
+  // dispatch failure: the error is recorded and the round finishes.
+  assert.ok(state.lastError?.includes('simulated interrupt failure') === true)
+  assert.equal(teamOf(state).stallInterrupts, 0)
+  assert.equal(teamOf(state).ticks, 1)
+})
+
 await test('writes a boot marker before the first round', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'autopilot-boot-'))
   const file = join(dir, 'status.log')
@@ -845,7 +1190,21 @@ await test('writes a boot marker before the first round', async () => {
   // A restart is otherwise only visible as `ticks=1`, which says nothing about
   // which build came back or which settings it is running with.
   assert.match(lines[0] ?? '', /autopilot-start version=\d+\.\d+\.\d+ /)
-  assert.match(lines[0] ?? '', /tickMs=60000 wakeMs=0 reclaimMs=300000 retryLimit=3 reclaimOnFailed=true heartbeatMs=600000 dryRun=false maxConcurrent=2 errorThreshold=3$/)
+  // The exact settings sequence, on purpose. A setting that reaches the line
+  // without reaching this assertion is a restart whose log no longer describes
+  // the run it belongs to — the same drift that let `liveness=*` ship unlogged
+  // by the test. Asserted as one string rather than a regex so a failure prints
+  // the line that did arrive.
+  const settings = [
+    'tickMs=60000', 'wakeMs=0', 'reclaimMs=300000', 'retryLimit=3',
+    'reclaimOnFailed=true', 'heartbeatMs=600000', 'dryRun=false',
+    'maxConcurrent=2', 'errorThreshold=3', 'liveness=on', 'livenessMs=60000',
+    'livenessSettleMs=3000', 'stalledMs=0', 'interrupt=off', 'wakeBudget=off',
+  ].join(' ')
+  assert.ok(
+    (lines[0] ?? '').endsWith(settings),
+    `boot line does not end with the expected settings\n  got: ${lines[0]}`,
+  )
 })
 
 await test('survives a host exception mid-round instead of exiting the loop', async () => {
@@ -927,6 +1286,107 @@ await test('trim failure backs off instead of re-reading every round', async () 
   resetTrimFailures()
 })
 
+await test('resumes trimming once the hold on the log is released', async () => {
+  // The back-off exists to stop the quadratic re-read, not to give up. A file
+  // held open by a `tail` is released eventually, and a one-way switch would
+  // leave the log untrimmed for the rest of the process — losing the ceiling,
+  // which is the whole point of having one.
+  const { appendStatusLineWith, resetTrimFailures } = await import('../src/observe.ts')
+  resetTrimFailures()
+  let now = 1_000_000
+  let holding = true
+  let renames = 0
+  const fs = {
+    append: async () => undefined,
+    stat: async () => ({ size: 200 * 1024 }),
+    read: async () => 'a\nb\nc\nd\n',
+    write: async () => undefined,
+    rename: async () => {
+      if (holding) throw new Error('file held open')
+      renames += 1
+    },
+  }
+  const clock = (): number => now
+  for (let index = 0; index < 6; index += 1) {
+    await appendStatusLineWith('/x/status.log', 'round', fs, clock)
+  }
+  assert.equal(renames, 0, 'every trim failed while the file was held')
+
+  // Released, but still inside the back-off window: nothing is retried yet.
+  holding = false
+  await appendStatusLineWith('/x/status.log', 'round', fs, clock)
+  assert.equal(renames, 0, 'a retry inside the back-off window would be the quadratic read again')
+
+  // Past the window the trim runs again, and a success clears the back-off.
+  now += 40_000
+  await appendStatusLineWith('/x/status.log', 'round', fs, clock)
+  assert.equal(renames, 1, 'the trim resumed instead of staying latched off')
+  resetTrimFailures()
+})
+
+await test('a refusal frees the task for a colleague without waiting out the cooldown', async () => {
+  // The cooldown exists so a teammate's thinking time is not mistaken for a
+  // refusal. Once the turn ends without a claim the question is answered, and
+  // the task must not sit behind the rest of the window: with the default 60s,
+  // one refusal would idle a free member for the better part of a minute while
+  // the sidebar reads claimable=0 slots=1.
+  const host = makeHost(
+    [task({ id: 't1', status: 'pending', ready: true })],
+    [member('lead', 'running', 'lead'), member('alice', 'inactive'), member('bob', 'inactive')],
+  )
+  const state = freshState()
+  const liveness = createLiveness()
+  const config: Required<Config> = {
+    ...baseConfig,
+    maxConcurrent: 1,
+    wakeCooldownMs: 60_000,
+    livenessSettleGraceMs: 0,
+  }
+  const ctx = makeCtx(host)
+  const wake = new Map<string, number>()
+
+  await tick(ctx, lead, config, state, 'team-1', wake, new Map(), createBreaker(), signal, liveness)
+  assert.deepEqual(host.sent, ['alice'], 'the only idle member gets the wake first')
+
+  // Alice reads the wake and ends her turn without claiming it.
+  liveness.mark('alice', 'running', Date.now())
+  liveness.mark('alice', 'idle', Date.now())
+
+  await tick(ctx, lead, config, state, 'team-1', wake, new Map(), createBreaker(), signal, liveness)
+  const team = teamOf(state)
+  assert.equal(team.unclaimed, 1, 'the wake is settled as a refusal')
+  assert.deepEqual(host.sent, ['alice', 'bob'], 'the answered task goes to the other member at once')
+  assert.equal(team.suppressed, 0, 'a known answer is not a reason to suppress')
+})
+await test('says so when the status file cannot be written, and clears when it can', async () => {
+  // The log is the only thing a headless user reads. Every way it breaks
+  // (relative path, a directory nobody created, a permission the sandbox took
+  // away) fails identically on every round, and used to leave no trace at all:
+  // an empty file reads exactly like "nothing happened all day".
+  const dir = await mkdtemp(join(tmpdir(), 'autopilot-status-'))
+  const host = makeHost([], [member('lead', 'running', 'lead')])
+  const state = freshState()
+  const ctx = makeCtx(host)
+  const config: Required<Config> = {
+    ...baseConfig,
+    maxConcurrent: 1,
+    statusFile: join(dir, 'no-such-dir', 'status.log'),
+    // Write every round, so the second tick really attempts an append instead
+    // of deciding the line has not changed and skipping it.
+    statusHeartbeatMs: 0,
+  }
+
+  await tick(ctx, lead, config, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).statusWriteFailed, true, 'a dead log must not look like a quiet team')
+
+  // Point it somewhere writable: the flag has to clear, not latch on.
+  const fixed: Required<Config> = { ...config, statusFile: join(dir, 'status.log') }
+  await tick(ctx, lead, fixed, state, 'team-1', new Map(), new Map(), createBreaker(), signal)
+  assert.equal(teamOf(state).statusWriteFailed, false, 'recovery is visible too')
+
+  const text = await readFile(join(dir, 'status.log'), 'utf8')
+  assert.match(text, /team=team-1/, 'the recovered file holds real rounds')
+})
 if (failures.length > 0) {
   console.error(`FAILED ${failures.length}`)
   for (const line of failures) console.error(`  - ${line}`)

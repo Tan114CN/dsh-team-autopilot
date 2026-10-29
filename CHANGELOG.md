@@ -3,7 +3,216 @@
 本项目的所有值得注意的变更都会记录在此文件。
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
-版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+版本号遵循 [语义化版本](https://semver.org/lang-CN/)。
+
+## [0.6.4] - 2026-10-29
+
+### 修复
+
+- **peer 范围静默排除了 harness 的 alpha 线。** `peerDependencies` 写的是 `>=0.2.1-rc.2 <0.3.0`，看起来覆盖 0.2.x 的所有版本——但 node-semver 只允许预发布版本满足「自身 `major.minor.patch` 元组带预发布标签」的那个比较符，于是 `0.2.2-alpha.2`（上游当前的 `alpha` tag）落在范围**之外**，且**没有任何警告**。上游 contributing 指南点名了这个坑。实测两种后果：在项目里同时存在本插件与 harness 依赖时，pnpm 会把用户明确请求的 `0.2.2-alpha.2` 悄悄换成 `0.2.1-rc.4`；宿主钉死版本时虽然能装上，但 `engines.dsh` 的同一写法会让插件管理器拒装。修法是按 contributing 指南的写法加显式 `||` 预发布分支：`>=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0`，`engines.dsh` 同步。
+  - 三个非 dsh 的 peer 有同样的问题，且修法要按各自的 tuple 分支写：`@deepseek-ai/cordis`（`>=4.0.5 || >=4.0.5-alpha.1 <5.0.0-0 || >=4.0.6-alpha.1 <5.0.0-0`）、`@deepseek-ai/schemastery`（`>=3.18.5 || >=3.18.5-alpha.1 <4.0.0-0 || >=3.18.6-alpha.1 <4.0.0-0`）。
+  - 已核验上游 `0.2.2-alpha.2` 的团队包里，本插件用到的 8 处 API（`tryMembership` / `listTasks` / `listMembers` / `waitForChange` / `updateTask` / `sendMessage` / `agents.roots` / `tools.register`）全部健在——所以这是**写法**过时，不是真不兼容。
+- **`repository` 指向了改名前的旧地址。** 仓库在 GitHub 上的 owner 是 `wooden-tan`（`Tan114CN` 是改名前的旧名，GitHub 会重定向）。`package.json` 的 `repository` / `homepage` / `bugs` 三处仍写旧名。npm↔仓库的映射靠 `repository` 字段自动采集，指回旧名会让映射取不到。README、资产脚本与 `docs/distribution.md` 里的链接一并改正。`author` 保留 `Tan114CN`——那是 npm 账号名（`tan114cn`），不是仓库地址。
+
+### 加固
+
+- `scripts/verify-pack.mjs` 新增三道发布期守卫：每个 `@deepseek-ai/*` peer 范围必须覆盖上游已发布的预发布版本（用真实 `semver` 判定，不是肉眼看字符串）、`engines.dsh` 必须同样覆盖、`repository` 必须指向现行仓库地址。已用「把范围退回旧写法」确认它在旧代码上为红（报 `0.2.2-alpha.2 not covered`）。
+- `semver` 加入 `devDependencies`（仅发布期守卫用，不进运行时依赖）。
+
+### 文档
+
+- README 的「类型对账通过」补上那个 `||` 分支的由来，并说明它不是冗余。
+- CHANGELOG 里那段 `[未发布]` 分节此前**错置在 0.3.6 之上**——0.3.9 那次提交把它插到了顶部，之后 0.4.0 / 0.4.1 连着发布，它没被转正，于是被越挤越深，最终卡在一个早已发布的版本中间。它描述的内容早已在 0.4.0 的文档同步里落地，留在那里只会让人以为那些改动还没发。
+
+## [0.6.3] - 2026-10-29
+
+### 新增
+
+- **`up=`：这些计数数了多久。** 状态工具第一行现在是 `autopilot active health=ok version=<x> up=17m`，`StatusReport` 新增 `uptimeMs`，`src/report.ts` 新增 `formatUptime(ms)`（`42s` / `17m` / `6h` / `3d`，单单位无小数）。所有计数器都在内存里，重启归零，而任务板不归本插件管、重启后照旧——`dispatched=3` 配 `up=3m` 是刚起步，配 `up=3d` 才是三天只派了三次；「唤醒预算刚花完却看起来没动」也只有带存活时长才读得出来。
+
+### 加固
+
+- **启动行与首行都被断言钉住。** `verify:status` 的首行断言从 `/autopilot inactive/` 收紧到 `/autopilot inactive health=off version=\S+ up=\d+[smhd]$/m`，并加 `assert.ok(result.uptimeMs >= 0)`；`warm` 夹具用 `...result` 展开，已带 `uptimeMs`，不会渲染出 `up=NaNd`。红证明：把 ` up=${formatUptime(report.uptimeMs)}` 从首行去掉，`verify:status` 立刻报 `The input did not match the regular expression /autopilot inactive health=off version=\S+ up=\d+[smhd]$/m`。
+- `tests/verify.ts` 加 `formatUptime` 边界测试（`0s` / `59s` / `1m` / `17m` / `1h` / `6h`（小单位直接丢弃、不四舍五入）/ `1d` / `3d` / 负值记 `0s`）；渲染测试的首行断言改为 `/^autopilot active health=ok version=test-build up=2m$/m`。verify 71 → 72 项。
+## [0.6.2] - 2026-10-29
+
+### 加固
+
+- **配置表加进漂移守卫。** 同一份默认值现在有四份副本：schema、`resolveConfig` 的 `??` 回退、启动日志行、README 的配置表。前两份已经被 `verify:status` 逐键比较过了，第四份没有——而它恰恰是操作者唯一会读的那份。它漂过：`livenessEnabled` / `livenessGraceMs` / `livenessSettleGraceMs` 发版时根本没进表，`stalledRunningMs` 与 `wakeBudgetPerHour` 也是后来补的。文档里的默认值写错的失败方向还特别讨厌：照着它去覆盖，得到的是「设了值但什么都没变」。
+- 守卫双向检查：`resolveConfig()` 的每个键都必须出现在表里，且**表里写的默认值与实际值逐键相等**；反过来，表里出现的键也必须仍然是配置项（删掉的配置不许在文档里留个影子）。字符串默认值按 `` `''` `` 记、对象按 `` `{}` `` 记，与表里现有写法一致。
+- `dryRun` 这类布尔与 `teamBudgets` 这类对象也在覆盖范围内——`JSON.stringify` 的 `false` / `{}` 正好就是表里写的形式，不需要为它们开特例。
+
+## [0.6.1] - 2026-10-29
+
+### 修复
+
+- **唤醒戳只增不减，一个任务一条，永不释放。** 每发一次唤醒就记一条 `taskId → 时间戳`，但只有两条路径会删它：成员明确拒绝、以及回收成功。任务被认领、被完成、被删除之后那条记录就留在表里了——而读取路径只查「即将派发的任务」，所以永远碰不到这些死条目。宿主进程活得越久、派过的任务越多，这张表就越长，每个条目带一个任务 id。这与之前修过的状态桶、`loop` 的四张 per-team 表是同一种形状，也同样不会让任何测试变红。
+- 顺带修掉一个潜在的错误抑制：任务被删除后如果复用同一个 id，新任务会继承旧任务的冷却，在窗口内表现为「被唤醒过、但没人接」，而实际上它从未被唤醒。
+
+### 设计说明
+
+- 清理放在每轮派发决策之前、按两条判据一次做完：戳已过期（比较的是 `now - stamp < wakeCooldownMs`，更老的戳再也不可能抑制任何事），或任务已不在这一轮的板上。前一条让表的规模从「本进程派发过的所有任务」变成「最近一个冷却窗口内派发过的任务」；后一条让删除掉的任务不留下痕迹，也顺手解决 id 复用。
+- 没有改成在认领/完成时逐点删除：那要把「任务怎么离开板子」的所有路径都枚举对（认领、完成、删除、被回收、被别的 Lead 改派……），漏一条就是同一种泄漏。按「还能不能起作用」清理与路径无关，也正是读取路径真正在意的那个问题。
+
+### 加固
+
+- `tests/verify.ts` 71 项（+1）：`forgets wake stamps that can no longer suppress anything`——过期的戳、不在板上的任务的戳都消失，还在窗口内的保留；`wakeCooldownMs: 0`（等于「从不抑制」）下一条都不留。
+- `tests/integration.ts` 45 项（+1）：`stops remembering a wake it can no longer hold back`——一条过期戳加一条孤儿戳在同一轮里被清空，而窗口内那条原样保留。已用「临时关掉清理调用」确认在旧代码上为红（`neither stamp can suppress anything again`）。
+- 自检 70 → 71 项，integration 44 → 45 项。
+
+## [0.6.0] - 2026-10-29
+
+### 新增
+
+- **唤醒预算 `wakeBudgetPerHour`：插件唯一花钱的动作现在有总闸了。** 唤醒就是发起一个模型回合，也就是钱，而此前所有上限都是按**任务**算的：`wakeCooldownMs` 管同一个任务不要被反复唤醒，`reclaimRetryLimit` 管同一个任务不要被无限回收。二十个就绪任务对五个空闲成员，一轮就能开出二十个回合，下一个小时再开二十个，而没有任何一处数字会说这件事。新配置按**队**统计**滚动一小时**内已发起的唤醒数，花完的那一轮直接不派发。默认 `0` = 不开——这是关于钱的策略，不该由插件的默认值替用户决定。
+- 被预算挡住的轮次在日志与报告里都留名：轮次行新增 `budget=used/limit`（`off` = 没设预算），`budgetSkips` 累加进 `skipped` 的括号里，`why=budget` 说明这一轮的原因。启动标记行新增 `wakeBudget=`（即使为 `off` 也印，否则「这一版没有预算」与「这一版预算为 0」在日志里无法区分）。
+
+### 设计说明
+
+- 窗口用**时间戳列表**而不是「窗口起点 + 计数」：计数器在窗口边界上会少报（12:59 发 59 条、13:01 再发 59 条，一小时里其实 118 条）。列表长度由预算本身封顶——额度花完后不再追加，所以它不会长过配置的上限。
+- `dryRun` 的模拟唤醒**也计入**预算：它代表同一个决定。否则打开 `dryRun` 看到的一小时派发量，第一轮真跑就复现不出来。
+- 「这一轮满了」和「这一小时的钱花完了」在任务板上长得一模一样，所以两者分开说：满员是下一轮自己会好（不产生 `blocked` 条目），预算花完要人决定抬上限还是等窗口滚动（`why=budget`）。
+
+### 修复
+
+- **`AutopilotState.teams` 的注释还在说「buckets 永不删除」。** 0.5.3 之前确实如此，之后加了 32 个桶的上限与「最久未 tick 者先淘汰」。注释留着会让人以为上限不存在，把「加了上限」当成又一次无界增长。
+
+### 加固
+
+- `tests/verify.ts` 70 项（+2）：`the wake budget measures the last hour rather than the calendar hour`（窗口是半开的——正好一小时的戳算过期；`0` 仍表示不限；花完不出现负数）与 `planDispatch spends the round on the wakes it is allowed, and says why it stopped`（额度是绑定约束时任务记 `budget` 而不是静默；额度花完时每一个都记；额度宽裕时满员轮次仍然安静——两种「什么都没发」不能混为一谈）。
+- `tests/integration.ts` 44 项（+1）：`a spent wake budget stops dispatch and says so, then refills`——两个空闲成员、两个就绪任务、额度 1：第一轮只发一条，第二轮一条都不发且 `skippedBudget >= 1`、`why` 含 `budget`，把时间戳老化到窗口外之后额度回来。已用「把额度改成 `Infinity`」确认在旧代码上为红。
+- 漂移守卫自动覆盖新增的 `skippedBudget` / `wakesThisHour` / `wakeBudget` 三个字段，只改 schema 或只改报告会当场报错。
+- 自检 68 → 70 项，integration 43 → 44 项。
+
+## [0.5.9] - 2026-10-29
+
+### 修复
+
+- **回收之后，旧唤醒还在冷却里压着任务。** 按任务的唤醒戳守的是「这一次尝试」，可回收把它留着了：任务回到池子、位置空出来、空闲同事在 roster 里排着，插件却要等下个冷却窗口结束才肯发唤醒。把 `reclaimAfterMs` 调到比 `wakeCooldownMs` 短就会稳定撞上（那时回收落在窗口内），默认值不会——所以它一直没在真机上露头。这与 0.5.4 修的「拒绝之后仍占满冷却」是同一类错误，只是这里等的对象从拒绝换成了回收。现在回收成功即删戳；`dryRun` 下同步生效，那正是预测该反映的东西。
+
+### 加固
+
+- `tests/integration.ts` 43 项（+1）：`a reclaim frees the task from the wake cooldown it was sent under`——预置一条 2 秒前的唤醒戳与 60 秒冷却，回收后必须立刻改派给另一个空闲成员。已用「撤回删戳」确认在旧代码上为红（`sent=[]`、`suppressed=1`）。
+- 自检 68 项、integration 43 项。
+
+## [0.5.8] - 2026-10-29
+
+### 新增
+
+- **状态工具给出一个单字判决 `health`。** 报告里每个数字单看都能解释成「正常」：`slots=0` 是满载、`parked=1` 是主动停派、`breaker=open` 是保护机制。真正的信息是它们之中哪个最坏，而这件事此前要读完整份报告才能推出来。现在第一行直接给出 `broken` > `stuck` > `blind` > `parked` > `ok` 里成立的那一个——顺序就是处置优先级，并且由 `tests/verify.ts` 断言，不是实现顺序的副产品。`halfOpen` 不算 `broken`：它还在派探针流量，能自己恢复。
+- **状态工具报告 `version`。** 启动日志里有同一个值，但日志恰好是「日志出问题」时唯一读不到的地方（见 0.5.5）。从工具里读，「我看的是哪一版」就不用靠猜。
+
+### 加固
+
+- `healthOf` 是 `report.ts` 里的纯函数：输入「是否启用」与逐队行，输出判决；`verify-status.mjs` 的 schema↔报告漂移守卫自动覆盖新增的两个字段，只改一边会当场报错。
+- 自检 67 → 68 项（新增处置顺序测试），integration 保持 42 项。
+
+## [0.5.7] - 2026-10-29
+
+### 修复
+
+- **熔断打开时，整轮都被跳过了，不只是派发。** 早退发生在结算、回收、卡死观察之前，于是 `openCooldownMs` 这段静默期里，陈旧的 owner 依然占着槽位、没人被回收、卡死也不上报。代价是双份的：冷却熬过去、熔断闭合，结果第一条唤醒还是发不出去——因为唯一的槽位仍被那个陈旧 owner 拿着，得再等满一个 `reclaimAfterMs`。现在熔断只挡住派发，其余照跑；被挡的轮次照样写状态行（那是日志最该说话的时刻，`breaker=open` 本身也值得被看见）。
+
+### 加固
+
+- `tests/integration.ts` 42 项（+1）：`an open breaker still reclaims the slots it will need back`——熔断打开、无唤醒发出，但陈旧 owner 必须被回收，且 `slots` 在熔断期间就能看到腾出来的位置。已用「恢复旧早退」确认在旧代码上为红。
+- 顺带修好一处连带症状：被熔断挡住的轮次现在也会刷新 `lastTickAt`、刷新板上的数字，所以状态行里的 `age`、`slots`、`tasks` 不再停留在熔断前那一轮——过去它们会一直冻在那，看起来像主循环已经停了。
+## [0.5.6] - 2026-10-29
+
+### 修复
+
+- **`halfOpenProbe: 0` 会让熔断器永久卡在 half-open。** 冷却结束转入 half-open 时，探针配额直接取自配置；为 `0` 时 `canDispatch` 恒为 `false`，而 `recordSuccess` 只在真的派发之后才被调用，于是配额永远停在 `0`，团队再也不会收到一条唤醒——没有报错、没有 trip，`breaker=halfOpen` 看起来像还在试探，只有重启进程才能恢复。修法两层：`evaluate` 转入 half-open 时把配额钳到至少 1，且遇到「half-open 但配额已耗尽」的既有状态时直接闭合（那是死路，不是状态）；`resolveConfig` 增加 clamp。
+- **配置兜底只覆盖了一半的键。** `resolveConfig` 自称「绕过校验时的最后一道防线」，却只钳了 5 个键，漏掉的恰好是会把槽位静默归零的那些：`maxConcurrent`、`halfOpenProbe`、`teamBudgets`（`0` 预算 = 永不出动的团队）。现在所有有界的数值都过 `clamp()`，逐队预算也逐项收敛。故意不设上限的只有 `wakeCooldownMs` / `statusHeartbeatMs`：长冷却只是慢，钳掉反而会悄悄改写操作者的意图。
+
+### 加固
+
+- `verify-status` 新增 clamp 断言（零预算、零探针、零阈值、超出上限的停车次数、逐队预算），并保留「零冷却 / 零心跳是合法选择」的反向断言——把合法值也钳掉，是另一种静默改语义。
+- `tests/verify.ts` 67 项（+1）：half-open 无探针必闭合；`tests/integration.ts` 41 项（+1）：冷却到期后必须真的再次派发（用 `halfOpenProbe: 0` 直接喂给 `tick`，证明即使非法值抵达也不会卡死）。二者都已用「撤回修复再跑」确认在旧代码上为红。
+## [0.5.5] - 2026-10-29
+
+### 修复
+
+- **`statusFile` 写不进去时，一声不响。** 追加失败一路被 `catch` 吞掉，`recordStatus` 也不看结果。于是路径写错、目录没人建、沙箱收走了写权限——这些都会在**每一轮以同样的方式失败**，而唯一的痕迹是「文件不存在或一直是空的」，那和无事发生的安静团队在观感上完全一样。对 headless 用户来说，这是最要命的一种假象：他以为自己看到的空日志是「今天没人干活」。现在 `appendStatusLineWith` 返回布尔（仍然从不抛），`recordStatus` 把它记进 `TeamState.statusWriteFailed`，`team_autopilot_status` 在受影响的团队下打一行 warning 说明该查路径／目录／权限；写入恢复后标记自动清除，报的是**正在发生**的问题而不是记住的问题。
+- **只吞掉「追加」失败，不误报裁剪失败。** 日志被 `tail` 占住导致裁剪失败时，行其实写进去了，那有它自己的退避与 `trim=failed` 标记；把它算进写失败会在每一轮错怪错的东西。
+
+### 加固
+
+- 回归测试：`verify` 66 项（原 65）、`integration` 40 项（原 39）。集成侧用一个不存在的子目录做 `statusFile`，断言第一轮 `statusWriteFailed=true`、换成可写路径后 `false`、并且真文件里能读到 `team=` 行——两个方向都钉住，避免「永远为真」也能通过。渲染侧断言 warning 文案，且 `TEAM_SCHEMA` 增加 `statusWriteFailed`（`required`），漂移守卫会要求 schema 与真实报告同时带上它。
+
+## [0.5.4] - 2026-10-29
+
+### 修复
+
+- **成员已经明确拒绝，任务仍被冷却压住。** `tick` 的结算循环把一次唤醒判成 `unclaimed`（成员读过唤醒、回合结束但没有认领）时，只把该成员记进 `declined`，却没有清掉 `lastWake` 那张按任务的抑制表。于是从下一轮起，派发循环照旧让这个任务等满 `wakeCooldownMs`（默认 60 秒）——尽管答案已经知道，别的空闲成员本可以立刻接手。卡片上看到的就是 `claimable=1 slots=1` 却一条唤醒都不发。现在判定的同一刻就删戳：冷却的存在是为了「不把成员的思考时间误判成拒绝」，而回合结束即职责结束；拒绝的成员仍由 `declined` 排除，所以删戳不会把同一个人再喊一遍。liveness 关闭时本就要等满冷却才结算，删戳在那条路径上没有副作用。
+
+### 加固
+
+- 回归测试：`integration` 39 项（原 38）。新增的 `a refusal frees the task for a colleague without waiting out the cooldown` 在旧实现上直接失败（`sent` 停在 `['alice']`），并且同时钉住 `suppressed === 0`——将来若只删了戳、却留下别的抑制判断，这条断言会当场报错。
+
+## [0.5.3] - 2026-10-29
+
+### 修复
+
+- **状态工具顶部的「实时板」把停派任务算成了可派发任务。** `readCallerBoard` 调 `boardSummary` 时把 `parked` 传成 `undefined`，而那个参数唯一的作用就是把停派任务从 `claimable` 里摘出去。于是同一次输出里，`caller … claimable=1` 与下面团队行的 `parked=1` 说的是同一个任务，两个数字互相矛盾。0.4.0 修过团队桶的同一个问题，`caller` 那一处漏了。
+- **顺带把这段逻辑从 `index.ts` 提到了纯函数 `callerBoard`（`src/select.ts`）。** 原来它藏在 `apply` 的闭包里，没有 `ctx.agentTeams` 就测不到，这正是它漏掉的原因。现在停派与已承诺槽位都由 `callerBoard` 折叠，`tests/verify.ts` 可以直接喂一个带 `parked` / `pendingWakes` 的状态桶断言结果。
+- `boardSummary` 的 `parked` 参数类型放宽为 `ReadonlyMap<string, unknown>`：它只读键集合，这样状态里的 `Map<string, ParkRecord>` 能直接传进来，不必在调用处再造一份投影。
+- **`caller` 行补上 `parked=`，否则修完上面那条，它自己的数字就对不上账了。** 停派任务被从 `claimable` 里摘掉之后，`caller` 行只剩下 `tasks / inFlight / claimable / blocked / done`，而这几个数相加不再等于 `tasks`——差额去哪了没人说。停派恰恰是「明明有空位却没动静」最常见的原因，所以这个计数必须出现在同一行上（`blocked` 原本就不含它）。
+
+### 加固
+
+- 回归测试：`verify` 65 项（原 64）。新增的 `callerBoard folds parking and promised slots into the live view` 在旧实现上会读到 `claimable=2 / parked=0`，直接失败；渲染测试现在逐字钉住整行 `caller team=… tasks=2 inFlight=1 claimable=0 parked=1 …`，少一个计数字段就红；`scripts/verify-status.mjs` 的漂移守卫同时要求 `CALLER_SCHEMA` 与真实报告都带 `parked`——只改一边，守卫当场报错。
+
+## [0.5.2] - 2026-10-29
+
+### 修复
+
+- **日志裁剪会把启动标记整行弄丢。** `appendStatusLineWith` 用 `line.startsWith('autopilot-start ')` 去找启动标记，但那行的形状是 `<iso> autopilot-start …`——标记从不在行首，所以这个查找从来没有匹配到一次，第一次裁剪就把唯一能回答「跑的是哪个 build、哪套配置」的那行丢掉。README 里「裁剪后版本/配置仍可 grep」的承诺此前并不成立。现在改用 `/^\S+ autopilot-start /`。
+- **同一行启动标记会被重复写入，` (trimmed)` 会层层叠加。** 如果重启不久、标记仍落在保留的尾半里，旧代码会再前置一份，文件里就出现两行 `autopilot-start`；二次裁剪又会把上一轮写入的 ` (trimmed)` 行再拼一个后缀。现在：带 ` (trimmed)` 的先剥掉后缀再判断，尾半里已有标记就不再前置。
+- **裁剪失败的退避曾是一道单向开关。** `trimFailures >= TRIM_FAILURE_LIMIT` 之后直接 `return`，从此不再重试——于是一次短暂的 Windows 文件占用（一个只读共享打开日志的 `tail`）就会让本进程永久失去裁剪能力，日志随之一路无上限增长，恰好是裁剪本身要防的那件事。现在改成按时间退避（1s 起、每次失败翻倍、封顶 30s），占用解除后自动恢复；`trim=failed` 标记仍会在第 3 次连续失败时写一次。`appendStatusLineWith` 增加可选 `clock` 参数，供测试注入时间。
+
+### 加固
+
+- 回归测试 `verify` 64 项（原 61）、`integration` 38 项（原 37）：用假的 `StatusFs` 造 1300 行 / ~150 KB 日志，断言裁剪后启动标记恰好一行且带 ` (trimmed)`、二次裁剪不出现 `(trimmed) (trimmed)`、标记已在尾半时不再前置。这个测试在旧实现上直接失败（0 行标记），测的是真缺陷而不是形状。
+
+## [0.5.1] - 2026-10-29
+
+修补了四处「数字对得上、行为不对」的地方。没有配置项的默认值变动，旧配置直接可用。
+
+### 修复
+
+- **`dryRun` 不再伪造「拒绝」。** 模拟模式下没有人真的收到唤醒，但结算循环照样在冷却到期后把每条未答复的唤醒判成 `unclaimed`，写进 `declined`，于是后续轮次 `why=declined` 并把该成员永久排除——演示的是自己的记账污染，而 `dryRun` 恰恰是 README 推荐的首跑模式。现在模拟唤醒带 `simulated` 标记：它继续占槽（预测才忠实），但绝不被判定。
+- **一个已唤醒、尚未被认领的任务不再被重复派发。** `pendingWakes` 里的任务在板上仍然是「无主且就绪」，所以下一轮会再派一次，随即被冷却抑制——那一个槽位就白白花掉了，排在后面的就绪任务因此被饿住。现在这些任务直接跳过，不再占用本轮的计划名额。
+- **这类任务的写作用域现在真的被占住了。** 成员随时可能认领并开始写，而板上还看不出任何迹象；此前同一轮里作用域重叠的另一个任务照派不误，正是这套作用域规则存在的意义所在。
+- **`lastStall` 终于出现在状态报告里。** `toTeamReport` 映射了 `stalled` / `stallWarnings` / `stallInterrupts`，却漏了 `lastStall`——schema 有它、渲染有它、数据没接上，于是状态工具永远不输出这一行。
+- **团队状态桶有了上限（32 个）。** `AutopilotState.teams` 原本只增不减，长期存活的宿主每见到一个新 TeamId 就多一个桶，状态报告跟着一起长。现在超额时淘汰最久未 tick 的桶：活着的团队每轮都 tick，永远不会是受害者。
+
+### 加固
+
+- **`resolveConfig` 从 `apply` 里提出来并导出。** 手写 clamp 依然是绕过校验时的最后一道防线，但现在默认值只有一处来源。
+- **新增两道漂移守卫（`scripts/verify-status.mjs`）。** 其一：各输出 schema 的键集合必须与真实报告逐键相等（且 `required` 的键必须真的出现）；其二：`Config({})` 的默认值必须逐键等于 `resolveConfig()`。第一道守卫上线当场就抓出了上面那个 `lastStall` 缺陷——这类「schema 有、报告没有」的静默不一致，此前只能靠人肉对照。
+- 回归测试：`verify` 61 项（原 59）、`integration` 37 项（原 36）。
+
+
+## [0.5.0] - 2026-10-29
+
+补上了「卡住但看起来在干活」这半边盲区，并清掉了两处以「看起来绿」代替「真的绿」的地方。日志格式有**新增字段**（`stalled=` / `interrupts=` / `stalls=` / 启动行 `stalledMs=` / `interrupt=`），只读旧字段的 grep 脚本不受影响。
+
+### 新增
+
+- **长回合卡死观测（`stall.ts`）。** 回收只处理「已经不在干活」的 owner，而卡死恰恰长成「看起来在干活」：驱动不返回、取消没写终态。此时任务永远 `in_progress`、槽位永远被占、熔断永远不 trip（没报错），团队静默停摆而每个数字都正常。现在 `stalledRunningMs`（默认 15 分钟，`0` 关闭）之后会把它报成 stall：状态日志 `stalls=task<owner`、团队行 `stalled=`/`interrupts=`、状态报告多一行 `lastStall task=… owner=… for=…ms`。**观察窗从「首次观测」与「当前回合起点」的较晚者起算**，首次看到绝不当场判罚——否则跑得久的回合中途认领新任务会被瞬间判死。
+- **`interruptStalled`（默认关）。** 打开后对 stall 的成员调用官方 `interrupt`，同一 stall 只断一次（`interruptedAt` 记在观察表里）；`provisioning` 只报不断（还没有回合可取消）；`dryRun` 下永不中断。默认关的理由很直接：中断会掐掉正在做的工作，误判的代价是一个下午，漏判的代价是一个空槽等人来看。
+- **槽位把未 claim 的唤醒算作已承诺。** `slots` 之前只减 `inFlight`，而唤醒到 claim 之间有空窗，这段空窗里同一批空闲成员会被重复唤醒。现在减的是 `inFlight + 仍未结算的 pendingWakes`（只计任务仍可认领的），日志 `pending=` 与 `slots=` 从此自洽。
+
+### 修复
+
+- **`scripts/verify-status.mjs` 的宿主桩补上 `ctx.on`。** liveness 特性加进 `apply` 后，这个脚本在 `trackLiveness` 处抛 `TypeError: ctx.on is not a function` 直接死掉，README 却仍写着 PASS——它已经有一段时间没有真正校验过输出 schema 了。
+- **`tests/integration.ts` 的启动标记断言跟随启动行。** liveness 字段加进 `autopilot-start` 后断言正则没跟着改，`integration` 一直是红的。现在改成按整段设置序列断言，失败时直接打印到达的那一行。
+- **`cordis.patch.yml` 不再复制默认值。** 它之前把 11 个键连同默认值抄了一遍，schema 默认值一改就悄悄覆盖掉用户意图；新加的特性（`reclaimRetryLimit` / `statusFile` / `liveness*` / `stalled*`）也从没同步进去。现在只保留 `enabled: true`，默认值只有 schema 一份。
+
+### 文档
+
+- README 配置表补齐 `livenessEnabled` / `livenessGraceMs` / `livenessSettleGraceMs` / `stalledRunningMs` / `interruptStalled`。
+- 新增设计决策 10（卡死观测）与「为什么异常不能叫醒 Lead」：官方 `sendMessage` 禁止给自己发消息，Lead 只能被 root 的 `steer` 唤醒，而那条路要求插件冒充 teammate 说话——为了告警污染消息来源不值得。所以上报只走 `statusFile` / 状态工具 / 报告渲染三条不花 token 的通道。
 
 ## [0.4.1] - 2026-10-29
 
@@ -91,16 +300,6 @@
 ### 真机实证
 
 - **回收停派已在真实宿主上验证**（2026-10-28，桌面 0.2.1-rc.3，`reclaimAfterMs: 60000`、`reclaimRetryLimit: 3`，`dryRun: false`）。两个停手成员 `stall-a` / `stall-b` 让任务空转，`ticks=9/23/29` 三圈回收后 `park=task-1<stall-a after=3`、`why=parked`、`parked=1`，`reclaimed` 停在 3（没有第 4 次），`dispatched` 冻结在 2、停派后日志安静。任务停派时仍 `claimable=1`——只停派发、不动任务板。README「仍未验证」里该条移除，`docs/verify-reclaim.md` 已知限制第 2 条补实测值。
-
-## [未发布]
-
-### 文档
-
-- `docs/distribution.md` 的「现状」表把 `GitHub topics` 写成**空数组**、`description` 写成 **null**，而这两项 2026-10-28 已写入。分发是当前唯一的瓶颈，一份把自己已完成的动作记成待做的清单，会让下一个读者重复做一遍、或在错前提上判断。动作 1 标为已完成，门槛表里只剩**仓库年龄**一项未满足（`created_at=2026-10-27T18:17:09Z`，北京时间 10-29 02:17 达标）。
-- README 的「先挂 waiter，再读状态」原先只写「`waitForChange` 内部是一个 `Map<TeamId, Set<Waiter>>`」，读的人无从核实。现在点名到官方 `TeamActivity.waiters`——`lib/index.js` 里 `new Map()` 配 `new Set()`，装完依赖就能看一眼。
-- README 的「不做独立工作目录」补全了参数来源：工具 schema 只有 `name` / `description` / `prompt` / `context` 四个参数，服务层 `SpawnTeammateRequest` 另有 `provider` 与 `signal`，但 `provider` 由 profile 配置按 `context` 选（`forkProvider` / `freshProvider`）、`signal` 由宿主注入，两者都不是调用方能指定的。这条正好加固「不做 per-member model」的边界论证——`agentOptions` 不在任何一层。
-- README 的「官方另有 9 个团队工具」补出枚举（`spawn_teammate` / `send_message` / `wait_agent` / `interrupt_agent` / `list_agents` 加 4 个 `team_task_*`），可在应用包内逐名核对。
-- 「类型对账通过」原写「代码按 rc.3 源码结构编写，类型来自 `0.2.1-rc.2`」，两个 rc 混在一句里、读者会以为依赖了 rc.3。改为：devDependency 钉 `rc.2` 作对账基准，peer 范围 `>=0.2.1-rc.2 <0.3.0` 会接受后续 rc（上游 `next` 现为 `rc.4`），但没逐个复核，升级时重跑 `tsc` 与 `npm test`。
 
 ## [0.3.6] - 2026-10-28
 

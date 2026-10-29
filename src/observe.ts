@@ -32,7 +32,7 @@ import type { TeamState } from './state.ts'
  * @returns the package version, or `unknown` if the manifest cannot be read.
  */
 let cachedVersion: string | undefined
-function version(): string {
+export function version(): string {
   if (cachedVersion !== undefined) return cachedVersion
   try {
     const manifest = new URL('../package.json', import.meta.url)
@@ -73,6 +73,27 @@ export function startupLine(at: number, config: Required<Config>): string {
     // number with no origin, and a restart is exactly when those change.
     `maxConcurrent=${config.maxConcurrent}`,
     `errorThreshold=${config.errorThreshold}`,
+    // Whether waits are settled by an observed turn boundary or by the clocks
+    // alone. A restart is when this flips, and it changes what every `unclaim=`
+    // and every reclaim in the log means: the same number arrived by proof or
+    // by a timeout, and those are not the same claim.
+    ...(config.livenessEnabled
+      ? [
+        'liveness=on',
+        `livenessMs=${config.livenessGraceMs}`,
+        `livenessSettleMs=${config.livenessSettleGraceMs}`,
+      ]
+      : ['liveness=off']),
+    // Long-turn watch, with the same reasoning as the liveness group: a restart
+    // is when this flips, and it changes what every `stalled=` in the log means
+    // — a count of owners that outlived this window, published about to be
+    // cancelled or only reported.
+    `stalledMs=${config.stalledRunningMs}`,
+    `interrupt=${config.interruptStalled ? 'on' : 'off'}`,
+    // The spend cap, printed even when it is off: "this build had no budget"
+    // and "this build had a budget of zero" would otherwise look the same in a
+    // log where every `budget=` line reads `off`.
+    `wakeBudget=${config.wakeBudgetPerHour === 0 ? 'off' : config.wakeBudgetPerHour}`,
   ].join(' ')
 }
 
@@ -84,6 +105,17 @@ export function startupLine(at: number, config: Required<Config>): string {
  * a busy team reaches it in a day, and halving keeps the recent rounds.
  */
 const MAX_BYTES = 128 * 1024
+
+/**
+ * Match the boot marker anywhere it can appear in a line.
+ *
+ * The startup line is `<iso> autopilot-start …`, so the marker never sits at
+ * the start of the line. Matching it with `startsWith('autopilot-start ')`
+ * looked right and silently never matched: the first trim then dropped the
+ * only line that names the build, and the log started claiming the plugin had
+ * never booted — or was running whichever older build the reader assumed.
+ */
+const BOOT_LINE = /^\S+ autopilot-start /
 
 /**
  * Format one tick as a single greppable line.
@@ -119,6 +151,11 @@ export function statusLine(team: TeamState, at: number, lastError?: string): str
     // other meanings of "parked" in the wider report: the `park=` event line
     // and the totals `parked=` (currently-parked task count).
     `parkedSkips=${team.skippedParked}`,
+    // Cumulative like its siblings. Non-zero means the hourly wake budget is
+    // the reason tasks are waiting — the one cause that is a deliberate
+    // operator choice rather than a board problem, which is why it gets its
+    // own counter instead of hiding inside `skip`.
+    `budgetSkips=${team.skippedBudget}`,
     // Why this round skipped anything, deduplicated. `-` rather than omitting
     // the field: "nothing was skipped" is a fact a reader needs, and an absent
     // key is indistinguishable from an older build.
@@ -136,6 +173,20 @@ export function statusLine(team: TeamState, at: number, lastError?: string): str
     `done=${team.done}`,
     `idle=${team.idle}`,
     `slots=${team.slots}`,
+    // Wakes started inside the rolling hour against the cap (`off` when no
+    // budget is configured). Placed right after `slots` because it explains
+    // the number a reader would otherwise trust on its own: with the budget
+    // spent, `slots=2` still means nothing will be sent this round.
+    `budget=${team.wakesThisHour}/${team.wakeBudget === 0 ? 'off' : team.wakeBudget}`,
+    // The gauge: how many in-flight tasks are held by an owner that has been
+    // busy past the stall window. Sits beside `slots` because that is the pair
+    // a reader needs — `slots=0` alone is normal under load, and only
+    // `slots=0 stalled=2` says the team is wedged rather than busy.
+    `stalled=${team.stalled}`,
+    // Cumulative, like `reclaimed`: how often a stalled turn was cancelled.
+    // Only climbs with `interruptStalled`, which is off by default, so a
+    // non-zero value here also says the operator turned it on.
+    `interrupts=${team.stallInterrupts}`,
     `breaker=${team.breaker}`,
     `trips=${team.breakerTrips}`,
     `held=${team.breakerBlocked}`,
@@ -172,6 +223,13 @@ export function statusLine(team: TeamState, at: number, lastError?: string): str
   if (team.unparksThisRound.length > 0) {
     parts.push(`unparks=${team.unparksThisRound.join(',')}`)
   }
+  // This round's stalls, same shape as `reclaims`/`parks`. Reported as events
+  // rather than only through the `stalled` gauge because a round that sees two
+  // wedged turns should log both, and because the pair `task<owner` is what
+  // lets a reader go look at that member instead of guessing which one.
+  if (team.stallsThisRound.length > 0) {
+    parts.push(`stalls=${team.stallsThisRound.join(',')}`)
+  }
   // The error goes last and only when present: its presence *is* the signal,
   // and a constant `err=-` would both bloat every line and read as "all good"
   // when it means nothing. Collapse whitespace and cap at 120 chars so one
@@ -203,7 +261,7 @@ export function statusSignature(line: string): string {
     // quiet log — one whose work is stuck — and quietly turn the heartbeat
     // back into a per-tick write. The totals stay in the line for whoever
     // reads it; they just do not make a round newsworthy on their own.
-    .replace(/\s(?:skip|scope|noMember|declined|parkedSkips|suppressed|held)=\d+/g, '')
+    .replace(/\s(?:skip|scope|noMember|declined|parkedSkips|budgetSkips|suppressed|held)=\d+/g, '')
 }
 
 /**
@@ -214,8 +272,8 @@ export function statusSignature(line: string): string {
  * @param path - log file to append to; created if missing.
  * @param line - the line to append, without a trailing newline.
  */
-export async function appendStatusLine(path: string, line: string): Promise<void> {
-  await appendStatusLineWith(path, line, fsOps)
+export async function appendStatusLine(path: string, line: string): Promise<boolean> {
+  return appendStatusLineWith(path, line, fsOps)
 }
 
 /**
@@ -245,31 +303,44 @@ const fsOps: StatusFs = {
  *
  * Split from {@link appendStatusLine} so tests can inject a failing host; the
  * public entry point binds the real filesystem.
+ *
+ * @param path - log file to append to; created if missing.
+ * @param line - the line to append, without a trailing newline.
+ * @param fs - file operations (real filesystem in production).
+ * @param clock - injectable time source, so the trim back-off is testable.
+ * @returns whether the line reached the file. Never throws: observation must
+ *   not be able to stall a dispatch round. The caller is told the outcome so a
+ *   broken `statusFile` cannot fail in silence — that is the one channel a
+ *   headless user reads, and a wrong path or a missing directory would
+ *   otherwise look exactly like "nothing happened all day".
  */
 export async function appendStatusLineWith(
   path: string,
   line: string,
   fs: StatusFs,
-): Promise<void> {
+  clock: () => number = Date.now,
+): Promise<boolean> {
   try {
     await fs.append(path, `${line}\n`)
   } catch {
-    return
+    return false
   }
   // A trim that keeps failing must stop being retried every round. On Windows
   // a `rename` over a file another process holds open (a `tail` that only
   // shares read) fails, and retrying it every append turns the log into an
   // unbounded, quadratically re-read file: each round stats, reads the whole
   // over-limit file, writes a staged half, fails the rename, and swallows the
-  // error. Backing off after a few consecutive failures keeps the append cheap
-  // while the file is held, and a `trim=failed` line makes the condition
-  // visible instead of silent.
-  if (trimFailures >= TRIM_FAILURE_LIMIT) return
+  // error. Spacing the attempts out keeps the append cheap while the file is
+  // held. It has to be a delay, not a one-way switch: the hold is transient,
+  // and a switch that never flips back gives up the ceiling for the whole run.
+  const now = clock()
+  if (trimFailures >= TRIM_FAILURE_LIMIT && now < trimBlockedUntil) return true
   try {
     const info = await fs.stat(path)
     if (info.size <= MAX_BYTES) {
       trimFailures = 0
-      return
+      trimBlockedUntil = 0
+      return true
     }
     const lines = (await fs.read(path)).split('\n')
     // Keep the trailing half: the newest rounds are the ones worth reading,
@@ -281,8 +352,17 @@ export async function appendStatusLineWith(
     // alone drops it forever the first time the log passes its ceiling, which
     // then reads as "never booted / old version". Prepend the most recent
     // startup line so it stays discoverable without pinning it to the front.
-    const boot = [...lines].reverse().find(line => line.startsWith('autopilot-start '))
-    const kept = (boot === undefined ? [] : [`${boot} (trimmed)`])
+    const boot = [...lines]
+      .reverse()
+      .find(entry => BOOT_LINE.test(entry))
+      // A marker left by an earlier trim must not collect a second suffix.
+      ?.replace(/ \(trimmed\)$/, '')
+    // When a restart happened recently the kept tail already holds the marker;
+    // prepending another copy would put two `autopilot-start` lines in the file
+    // and make "which build is running" ambiguous — which is the one question
+    // this line exists to answer.
+    const tailHasBoot = tail.some(entry => BOOT_LINE.test(entry))
+    const kept = (boot === undefined || tailHasBoot ? [] : [`${boot} (trimmed)`])
       .concat(tail)
       .join('\n')
     // Write aside and rename: a truncating write leaves a half-written log if
@@ -292,8 +372,10 @@ export async function appendStatusLineWith(
     await fs.write(staged, kept)
     await fs.rename(staged, path)
     trimFailures = 0
+    trimBlockedUntil = 0
   } catch {
     trimFailures += 1
+    trimBlockedUntil = now + trimBackoffMs(trimFailures)
     if (trimFailures === TRIM_FAILURE_LIMIT) {
       try {
         await fs.append(path, 'trim=failed\n')
@@ -302,33 +384,52 @@ export async function appendStatusLineWith(
       }
     }
   }
+  // The line itself made it; only the trim failed, and that has its own
+  // back-off and its own marker. Reporting it as a write failure would blame
+  // the wrong thing on every round the file happens to be held open.
+  return true
 }
 
 /**
- * Consecutive trim failures before the autopilot stops retrying the trim.
- *
- * A trim is attempted after every append once the file exceeds its ceiling,
- * so a permanently failing trim would otherwise be retried on every round
- * forever. This counter backs off after a handful of consecutive failures and
- * is reset the moment a trim (or a sub-ceiling stat) succeeds.
+ * Consecutive trim failures, used to space out retries and to decide when the
+ * `trim=failed` marker has been written.
  */
 let trimFailures = 0
 
 /**
- * How many consecutive trim failures back the autopilot off the trim path.
+ * Epoch ms before which the trim path is skipped.
  *
- * Small on purpose: the point is to stop the quadratic re-read, not to wait
- * out a transient hold for long.
+ * A trim is attempted after every append once the file is over its ceiling, so
+ * a failing trim would otherwise be re-attempted (stat + whole-file read +
+ * staged write) on every round forever. Backing off by time instead of latching
+ * is the point: a `tail` holding the file open is transient, and a latch would
+ * stop this process from ever trimming again — losing the ceiling for the rest
+ * of the run, which is exactly the unbounded growth the trim exists to prevent.
  */
-const TRIM_FAILURE_LIMIT = 3
+let trimBlockedUntil = 0
 
 /**
- * Reset the trim back-off counter.
+ * Failures before the trim path starts backing off, and the delay it backs off
+ * by. The delay doubles per consecutive failure up to a ceiling: a long hold
+ * costs one attempt every 30s instead of a re-read on every round.
+ */
+const TRIM_FAILURE_LIMIT = 3
+const TRIM_BACKOFF_MS = 1_000
+const TRIM_BACKOFF_MAX_MS = 30_000
+
+/** Delay to wait after the given number of consecutive trim failures. */
+function trimBackoffMs(failures: number): number {
+  return Math.min(TRIM_BACKOFF_MS * 2 ** Math.max(0, failures - 1), TRIM_BACKOFF_MAX_MS)
+}
+
+/**
+ * Reset the trim back-off state.
  *
- * Exported for tests only: the counter is process-global (the autopilot runs
+ * Exported for tests only: the state is process-global (the autopilot runs
  * once per host), so a test that drives the failure path must be able to start
  * from a clean slate without leaking into the next test.
  */
 export function resetTrimFailures(): void {
   trimFailures = 0
+  trimBlockedUntil = 0
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-team-autopilot",
-  "version": "0.4.1",
+  "version": "0.6.4",
   "description": "Deterministic auto-dispatch for native DeepSeek Harness Agent Teams: wakes idle members when a task becomes ready, and turns advisory write scopes into an effective soft lock.",
   "keywords": [
     "dsh",
@@ -14,11 +14,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Tan114CN/dsh-team-autopilot.git"
+    "url": "git+https://github.com/wooden-tan/dsh-team-autopilot.git"
   },
-  "homepage": "https://github.com/Tan114CN/dsh-team-autopilot#readme",
+  "homepage": "https://github.com/wooden-tan/dsh-team-autopilot#readme",
   "bugs": {
-    "url": "https://github.com/Tan114CN/dsh-team-autopilot/issues"
+    "url": "https://github.com/wooden-tan/dsh-team-autopilot/issues"
   },
   "type": "module",
   "main": "dist/index.mjs",
@@ -35,6 +35,7 @@
     "dist/**",
     "cordis.patch.yml",
     "docs/**",
+    "CHANGELOG.md",
     "README.md"
   ],
   "sideEffects": false,
@@ -51,7 +52,7 @@
   },
   "engines": {
     "node": "^22.19.0 || >=24",
-    "dsh": ">=0.2.1-rc.2 <0.3.0"
+    "dsh": ">=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0"
   },
   "pnpm": {
     "nodeLinker": "hoisted"
@@ -70,18 +71,28 @@
     "prepublishOnly": "node node_modules/typescript/bin/tsc --noEmit && node tests/verify.ts && node tests/integration.ts && node scripts/verify-status.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.5",
-    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.2 <0.3.0",
-    "@deepseek-ai/dsh-experimental-agent-team": ">=0.2.1-rc.2 <0.3.0",
-    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3.0",
-    "@deepseek-ai/schemastery": ">=3.18.5"
+    "@deepseek-ai/cordis": ">=4.0.5 || >=4.0.5-alpha.1 <5.0.0-0 || >=4.0.6-alpha.1 <5.0.0-0",
+    "@deepseek-ai/dsh-agent": ">=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-experimental-agent-team": ">=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3.0 || >=0.2.2-alpha.2 <0.3.0-0",
+    "@deepseek-ai/schemastery": ">=3.18.5 || >=3.18.5-alpha.1 <4.0.0-0 || >=3.18.6-alpha.1 <4.0.0-0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-agent": { "optional": true },
-    "@deepseek-ai/dsh-experimental-agent-team": { "optional": true },
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "@deepseek-ai/schemastery": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-experimental-agent-team": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
@@ -90,8 +101,8 @@
     "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
     "@deepseek-ai/schemastery": "3.18.5",
     "@types/node": "^26.6.5",
+    "semver": "^7.8.5",
     "tsdown": "^0.22.2",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.11"
+    "typescript": "^6.0.3"
   }
 }

@@ -53,6 +53,38 @@ export interface PlanInput {
    */
   readonly avoid?: ReadonlyMap<string, ReadonlySet<string>>
   /**
+   * Slots already promised to a wake that has not been answered yet.
+   *
+   * A wake is a request, not a claim: between `sendMessage` and the member's
+   * own `claim` the task is still unowned on the board, so a round that looks
+   * only at the board sees the slot as free and hands it out a second time.
+   * Two wakes then race for one slot, one of them is wasted, and the team runs
+   * one member over its budget. Counting the unanswered wakes holds each of
+   * those slots until it is either claimed or given up.
+   *
+   * Reservations are bounded by the wake bookkeeping itself — an unanswered
+   * wake is settled at the latest one `wakeCooldownMs` after it was sent — so
+   * a reservation can delay capacity but can never ground it permanently.
+   */
+  readonly reserved?: number
+  /**
+   * Tasks a previous round already woke somebody for and is still waiting on.
+   *
+   * `reserved` keeps their slots; this keeps their *tasks*. Without it the
+   * next round walks the same unclaimed task, plans it again (the wake is
+   * suppressed by the cooldown, so the slot it just took is spent on nothing,
+   * and a ready task behind it is starved), and — because the task shows as
+   * unowned on the board — lets a *different* task with an overlapping write
+   * scope be handed out at the same time. The member may be about to claim the
+   * first task and start writing, so its scope has to be held exactly like
+   * in-flight work holds it.
+   *
+   * Ids are compared as strings, matching how the board keys are built.
+   * Entries for tasks no longer up for grabs are ignored: those are settled by
+   * the wake bookkeeping before planning.
+   */
+  readonly pending?: ReadonlySet<string>
+  /**
    * Parked tasks, mapped to the number of reclaims that parked them.
    *
    * Refused before every other cause: a parked task is held back however much
@@ -61,6 +93,16 @@ export interface PlanInput {
    * help. The count travels with the id because it is the whole reason.
    */
   readonly parked?: ReadonlyMap<string, number>
+  /**
+   * Wakes the team may still start inside the current hourly window.
+   *
+   * The concurrency ceiling bounds how many tasks are in flight; this bounds
+   * how many turns the autopilot may *start*, which is the unit the user pays
+   * in. It caps `slots` so a large board cannot turn into a large bill in one
+   * round. `0` means the budget is spent and nothing is dispatched this round;
+   * leaving it out (or `Infinity`) means no budget.
+   */
+  readonly wakeAllowance?: number
 }
 
 /** One autopilot decision round. */
@@ -186,7 +228,10 @@ export interface BoardSummary {
   readonly done: number
   /** Teammates eligible to take new work. */
   readonly idle: number
-  /** Free concurrency slots. */
+  /**
+   * Free concurrency slots: budget less work in flight and less the slots
+   * already promised to unanswered wakes.
+   */
   readonly slots: number
 }
 
@@ -211,14 +256,18 @@ export interface BoardSummary {
  * @param tasks - current board.
  * @param members - current roster.
  * @param maxConcurrent - effective concurrency budget for the team.
- * @param parked - task ids currently parked, with their reclaim count.
+ * @param parked - task ids currently parked. Only the key set is read; the
+ * value type is deliberately open so a `Map<string, ParkRecord>` straight out
+ * of the state can be passed here without a throwaway projection.
+ * @param reserved - slots already promised to unanswered wakes.
  * @returns the board summary.
  */
 export function boardSummary(
   tasks: readonly TeamTaskView[],
   members: readonly TeamMemberView[],
   maxConcurrent: number,
-  parked?: ReadonlyMap<string, number>,
+  parked?: ReadonlyMap<string, unknown>,
+  reserved = 0,
 ): BoardSummary {
   const inFlight = tasks.filter(isInFlight).length
   const ready = claimableTasks(tasks)
@@ -233,8 +282,49 @@ export function boardSummary(
     blocked: tasks.length - inFlight - claimable.length - (ready.length - claimable.length) - done,
     done,
     idle: availableMembers(members, tasks).length,
-    slots: Math.max(0, maxConcurrent - inFlight),
+    slots: Math.max(0, maxConcurrent - inFlight - Math.max(0, reserved)),
   }
+}
+
+/**
+ * Summarize the calling agent's own board as it is right now.
+ *
+ * The status tool reports the caller's team live rather than whatever team the
+ * loop happened to tick last, because that is the question the caller asked.
+ * But a live board computed from the raw task list alone answers a different
+ * question than the one the autopilot acts on: a parked task is still `pending`
+ * and unowned on the board, so it would be counted `claimable` here while the
+ * loop refuses to offer it. Two sections of one report then contradict each
+ * other for the same task.
+ *
+ * So the two pieces of memory that change the answer are folded in here, by the
+ * same rules the loop uses: parked tasks leave `claimable`, and slots promised
+ * to unanswered wakes stop counting as free.
+ * @param tasks - current board.
+ * @param members - current roster.
+ * @param maxConcurrent - effective concurrency budget for the team.
+ * @param bucket - this team's autopilot state, when it has been ticked. Absent
+ * means no task can be parked and no wake can be outstanding, so nothing needs
+ * folding in.
+ * @returns the board summary.
+ */
+export function callerBoard(
+  tasks: readonly TeamTaskView[],
+  members: readonly TeamMemberView[],
+  maxConcurrent: number,
+  bucket?: {
+    readonly parked: ReadonlyMap<string, unknown>
+    readonly pendingWakes: ReadonlyMap<string, unknown>
+  },
+): BoardSummary {
+  let reserved = 0
+  if (bucket !== undefined) {
+    const upForGrabs = new Set(claimableTasks(tasks).map(entry => String(entry.id)))
+    for (const taskId of bucket.pendingWakes.keys()) {
+      if (upForGrabs.has(String(taskId))) reserved += 1
+    }
+  }
+  return boardSummary(tasks, members, maxConcurrent, bucket?.parked, reserved)
 }
 
 /** One scope held by work that is already in flight or claimed. */
@@ -351,13 +441,33 @@ export function planDispatch(input: PlanInput): PlanResult {
   const { tasks, members, maxConcurrent } = input
   // Same rule as `boardSummary`, so the reported numbers match the decision.
   const inFlight = tasks.filter(isInFlight).length
-  const slots = Math.max(0, maxConcurrent - inFlight)
+  // Unanswered wakes hold their slot too: a wake is a promise that the slot is
+  // spoken for, even though the board still shows the task as unowned.
+  const reserved = Math.max(0, input.reserved ?? 0)
+  // Room on the board (in-flight + promised slots taken out) …
+  const capacity = Math.max(0, maxConcurrent - inFlight - reserved)
+  // … and room in the hourly wake budget. A wake is a model turn, so the
+  // budget can be the tighter of the two even when the board has space.
+  const allowance = Math.max(0, input.wakeAllowance ?? Number.POSITIVE_INFINITY)
+  const slots = Math.min(capacity, allowance)
   const free = availableMembers(members, tasks)
 
   const plans: DispatchPlan[] = []
   const blocked: BlockedTask[] = []
   const used = new Set<string>()
   const plannedScopes: Array<{ scope: string; taskId: string }> = []
+
+  // A task that is already out for a claim holds its write scope for the same
+  // reason in-flight work does: the member it was offered to may claim it and
+  // start writing any moment, and nothing on the board would show it yet.
+  const pending = input.pending ?? new Set<string>()
+  for (const task of tasks) {
+    if (!pending.has(String(task.id))) continue
+    for (const raw of task.writeScopes) {
+      const scope = normalizeScope(raw)
+      if (scope !== '') plannedScopes.push({ scope, taskId: task.id })
+    }
+  }
 
   /**
    * Why one task cannot be handed out this round, or undefined when it can —
@@ -420,6 +530,10 @@ export function planDispatch(input: PlanInput): PlanResult {
   }
 
   for (const task of claimableTasks(tasks)) {
+    // Already offered and still unanswered: it keeps its slot (that is what
+    // `reserved` counts) and it must not be offered a second time, which would
+    // burn a plan on a wake the cooldown is about to suppress.
+    if (pending.has(String(task.id))) continue
     const skip = input.avoid?.get(task.id)
     // Capacity is full. Stop handing out work — but keep walking the board so
     // the remaining tasks still record *why* they were not dispatched. A
@@ -428,8 +542,22 @@ export function planDispatch(input: PlanInput): PlanResult {
     // `why=-` (nothing skipped) when in fact the board held parked and
     // colliding work whose reasons were swallowed by board order.
     if (plans.length >= slots) {
-      const reason = explainSkip(task)
-      if (reason !== undefined) blocked.push(reason)
+      // Running out of room and running out of money look identical on the
+      // board, so name the cause that is actually binding. When the round is
+      // merely full, a healthy task gets no entry (normal backpressure: the
+      // next round picks it up). When the budget is the ceiling, every task
+      // left over gets `budget`, so `why=budget` always means "raise the
+      // budget" and never "the round was full".
+      if (plans.length >= capacity) {
+        const reason = explainSkip(task)
+        if (reason !== undefined) blocked.push(reason)
+      } else {
+        blocked.push({
+          taskId: task.id,
+          kind: 'budget',
+          reason: 'the hourly wake budget is spent — raise wakeBudgetPerHour or wait for the window to roll',
+        })
+      }
       continue
     }
 

@@ -74,14 +74,31 @@ export function evaluate(
         state: 'halfOpen',
         consecutiveErrors: 0,
         openedAt: undefined,
-        halfOpenRemaining: config.halfOpenProbe,
+        // Never zero: a half-open trial with no probe is a team that is allowed
+        // to try and not allowed to act. The config clamp already forces the
+        // configured value to >= 1; this keeps the invariant even when the
+        // breaker is fed a raw value straight from a test or a restored state.
+        halfOpenRemaining: Math.max(config.halfOpenProbe, 1),
       }
-      return { breaker: halfOpen, canDispatch: config.halfOpenProbe > 0 }
+      return { breaker: halfOpen, canDispatch: true }
     }
     return { breaker, canDispatch: false }
   }
   if (breaker.state === 'halfOpen') {
-    return { breaker, canDispatch: breaker.halfOpenRemaining > 0 }
+    // `halfOpen` with no probe left is not a state, it is a dead end: nothing
+    // will ever dispatch, so no success can ever be recorded, so the counter can
+    // never move again. It can only be reached by a zero `halfOpenProbe` (the
+    // schema forbids it, but the config clamp is the last line of defence for
+    // values that bypass validation), and the failure it causes is the worst
+    // kind: the team looks idle, the breaker looks like it is probing, and only
+    // a process restart recovers it. Close it instead.
+    if (breaker.halfOpenRemaining <= 0) {
+      return {
+        breaker: { state: 'closed', consecutiveErrors: 0, openedAt: undefined, halfOpenRemaining: 0 },
+        canDispatch: true,
+      }
+    }
+    return { breaker, canDispatch: true }
   }
   return { breaker, canDispatch: true }
 }
